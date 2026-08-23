@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>BetMind — acces</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@600;800&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#070d09; --surface:#0d1611; --surface-2:#121e17; --line:#1e2b22;
+    --green:#2ee86c; --green-dim:#1a8f45; --amber:#e8b33c;
+    --text:#e8f2ea; --muted:#8fa396; --danger:#ff6b6b;
+    --radius:14px;
+  }
+  *{box-sizing:border-box; margin:0; padding:0}
+  html,body{height:100%}
+  body{
+    background:var(--bg); color:var(--text);
+    font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    display:flex; align-items:center; justify-content:center; min-height:100dvh;
+    padding:20px;
+  }
+  body::before{
+    content:""; position:fixed; inset:0; pointer-events:none;
+    background:
+      radial-gradient(circle 130px at 50% 42%, transparent 128px, rgba(46,232,108,.05) 129px, rgba(46,232,108,.05) 130px, transparent 131px),
+      linear-gradient(to bottom, transparent calc(42% - 1px), rgba(46,232,108,.05) 42%, transparent calc(42% + 1px));
+  }
+  .card{
+    width:100%; max-width:360px; text-align:center;
+    background:var(--surface); border:1px solid var(--line); border-radius:var(--radius);
+    padding:32px 26px 26px;
+  }
+  .crest{width:58px; height:58px; margin:0 auto 14px; display:block}
+  h1{font:800 22px/1 "Sora",sans-serif; letter-spacing:.4px; margin-bottom:6px}
+  h1 em{color:var(--green); font-style:normal}
+  .sub{color:var(--muted); font-size:12.5px; margin-bottom:22px}
+  form{display:flex; flex-direction:column; gap:10px}
+  input[type=password]{
+    background:var(--surface-2); border:1px solid var(--line); border-radius:10px;
+    color:var(--text); font:inherit; padding:11px 14px; outline:none; text-align:center;
+  }
+  input[type=password]:focus{border-color:var(--green-dim)}
+  button{
+    background:var(--green-dim); color:#eafff1; border:none; border-radius:10px;
+    font:600 15px "Sora",sans-serif; padding:11px 14px; cursor:pointer;
+  }
+  button:hover{filter:brightness(1.12)}
+  button:disabled{opacity:.55; cursor:default}
+  #err{color:var(--danger); font-size:13px; min-height:18px; margin-top:10px}
+</style>
+</head>
+<body>
+
+<svg class="hidden" style="display:none"><defs>
+<symbol id="crest" viewBox="0 0 64 64">
+  <path d="M32 3 56 12v18c0 15-10 26-24 31C18 56 8 45 8 30V12L32 3z" fill="none" stroke="#2ee86c" stroke-width="3"/>
+  <circle cx="32" cy="30" r="10" fill="none" stroke="#2ee86c" stroke-width="2.5"/>
+  <path d="M32 20v20 M22 30h20" stroke="#2ee86c" stroke-width="2.5"/>
+</symbol>
+</defs></svg>
+
+<div class="card">
+  <svg class="crest" aria-hidden="true"><use href="#crest"/></svg>
+  <h1>Bet<em>Mind</em></h1>
+  <div class="sub">acces privat pentru testare</div>
+  <form id="form">
+    <input type="password" id="pw" placeholder="Parola de acces" autocomplete="current-password" autofocus required>
+    <button id="btn" type="submit">Intră</button>
+  </form>
+  <div id="err"></div>
+</div>
+
+<script>
+const form = document.getElementById("form");
+const pw = document.getElementById("pw");
+const btn = document.getElementById("btn");
+const err = document.getElementById("err");
+
+form.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  err.textContent = "";
+  btn.disabled = true;
+  try {
+    const resp = await fetch("/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: pw.value }),
+    });
+    if (resp.ok) { location.href = "/"; return; }
+    if (resp.status === 429) {
+      err.textContent = "Prea multe încercări. Reîncearcă peste ~15 minute.";
+    } else {
+      err.textContent = "Parolă greșită.";
+      pw.select();
+    }
+  } catch (e2) {
+    err.textContent = "Nu am putut contacta serverul.";
+  } finally {
+    btn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>

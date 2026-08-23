@@ -1,0 +1,42 @@
+# Secrete — nu ajung NICIODATĂ în repo.
+.env
+
+# Medii virtuale
+venv/
+.venv/
+
+# Artefacte Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Date locale (SQLite) — în producție stau pe volumul /data.
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Loguri și fișiere temporare
+*.log
+*.err
+
+*.docx
+*.png
+!static/*.png
+
+*.docx
+*.png
+!static/*.png
+
+# Documentatie interna si business - nu se urca
+*.docx
+*.png
+!static/*.png
+cursor_spec_betmind_v1_v2.md
+db_check.py
+features_app.md
+features.md
+Phase1.md
+Phase2.md
+FeaturesSave
+ToDo.md

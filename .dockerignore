@@ -1,0 +1,22 @@
+# Nimic din astea nu are ce cauta in imagine.
+.git
+.gitignore
+.env
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/
+*.db
+*.db-wal
+*.db-shm
+tests/
+*.log
+*.err
+*.png
+*.docx
+Dockerfile
+.dockerignore
+railway.json
+DEPLOY.md
