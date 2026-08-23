@@ -85,7 +85,30 @@ Apoi testul de acces:
 2. Introdu parola → intri în chat și totul funcționează normal.
 3. Parolă greșită de >10 ori în 15 minute → mesaj de limitare (rate-limit).
 
-## 7. Loguri și depanare
+## 7. Depanare: `unable to open database file`
+
+Dacă în loguri apare `sqlite3.OperationalError: unable to open database file`
+deși volumul e montat (`Mounting volume on: /data` în log), cauza e permisiunea
+pe punctul de montare: volumul se montează la **runtime**, peste directorul
+pregătit la build, și aparține lui `root` — iar aplicația rulează non-root.
+
+Rezolvarea e deja în repo: `docker-entrypoint.sh` pornește ca root, face
+`mkdir -p` și `chown` pe `$DATA_DIR`, apoi coboară la utilizatorul `betmind`
+(prin `gosu`) și lansează uvicorn. Dacă tot apare eroarea, verifică în loguri
+linia de diagnostic scrisă de aplicație — conține calea bazei, UID-ul
+procesului și permisiunile directorului:
+
+```
+Nu pot deschide baza de date. db_path=/data/betmind.db dir=/data uid=1000 gid=1000 dir_mode=drwxr-xr-x dir_owner=0:0 dir_exists=True dir_writable=False
+```
+
+- `dir_owner=0:0` cu `uid` diferit de 0 → chown-ul din entrypoint nu a rulat
+  (verifică `ENTRYPOINT` în Dockerfile și că scriptul are permisiune de execuție).
+- `dir_exists=False` → volumul nu e montat pe `/data` (revezi pasul 3).
+- `DATA_DIR` setat altfel decât `/data` → entrypoint-ul face chown pe altă cale
+  decât cea montată; ține-le identice.
+
+## 8. Loguri și depanare
 
 - Serviciu → tab **Deployments** → click pe deploy-ul activ → **View Logs**.
 - La pornire vezi raportul BetMind (chei setate, model, buget) și eventualele
@@ -96,7 +119,7 @@ Apoi testul de acces:
 - `/api/health` rămâne cel mai rapid instrument: buget API folosit azi, ultima
   sincronizare, numărul de fixtures din DB.
 
-## 8. Ce primesc testerii
+## 9. Ce primesc testerii
 
 - URL-ul public + parola comună (`ACCESS_PASSWORD`).
 - Fiecare browser primește automat propriul istoric de conversații și bilete

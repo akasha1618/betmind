@@ -8,11 +8,15 @@ local, WAL) — simplu, sigur intre task-uri asyncio si usor de testat.
 
 from __future__ import annotations
 
+import logging
 import os
+import stat
 from pathlib import Path
 from typing import Any, Optional
 
 import aiosqlite
+
+log = logging.getLogger("betmind.db")
 
 _SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -214,11 +218,44 @@ async def _connect() -> aiosqlite.Connection:
     return conn
 
 
+def _db_dir_diagnostics() -> str:
+    """Context pentru esecurile de tipul «unable to open database file»: cine
+    ruleaza procesul si cum arata directorul in care ar trebui scrisa baza.
+
+    Cazul clasic in productie: volumul montat peste director apartine lui root,
+    iar aplicatia ruleaza non-root — vezi docker-entrypoint.sh.
+    """
+    path = Path(db_path())
+    directory = path.parent if str(path.parent) not in ("", ".") else Path(".")
+    uid = getattr(os, "geteuid", lambda: "n/a")()
+    gid = getattr(os, "getegid", lambda: "n/a")()
+    parts = [f"db_path={path}", f"dir={directory}", f"uid={uid}", f"gid={gid}"]
+    try:
+        info = directory.stat()
+        parts.append(f"dir_mode={stat.filemode(info.st_mode)}")
+        parts.append(f"dir_owner={info.st_uid}:{info.st_gid}")
+    except OSError as e:
+        parts.append(f"dir_stat_error={e}")
+    parts.append(f"dir_exists={directory.exists()}")
+    parts.append(f"dir_writable={os.access(directory, os.W_OK)}")
+    if path.exists():
+        parts.append(f"file_writable={os.access(path, os.W_OK)}")
+    return " ".join(parts)
+
+
 async def init_db() -> None:
     """Creeaza schema si seed-uieste tracked_leagues din DEFAULT_LEAGUES."""
     from football_data import DEFAULT_LEAGUES  # import lazy — evita ciclul
 
-    conn = await _connect()
+    directory = Path(db_path()).parent
+    if str(directory) not in ("", ".") and directory.exists() and not os.access(directory, os.W_OK):
+        log.error("Directorul bazei de date nu e scriabil. %s", _db_dir_diagnostics())
+
+    try:
+        conn = await _connect()
+    except Exception:
+        log.error("Nu pot deschide baza de date. %s", _db_dir_diagnostics())
+        raise
     try:
         for lid, name in DEFAULT_LEAGUES.items():
             await conn.execute(

@@ -225,3 +225,34 @@ async def test_db_directory_created_on_startup(monkeypatch, tmp_path):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "adanc" / "nou" / "b.db"))
     await db.init_db()
     assert (tmp_path / "adanc" / "nou" / "b.db").exists()
+
+
+async def test_db_diagnostics_report_path_uid_and_permissions(tmp_path, monkeypatch):
+    """Diagnosticul pentru «unable to open database file» (volum montat de root)
+    trebuie sa spuna: ce cale, ce UID si ce permisiuni are directorul."""
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "vol" / "betmind.db"))
+    (tmp_path / "vol").mkdir()
+
+    report = db._db_dir_diagnostics()
+
+    assert "db_path=" in report and "betmind.db" in report
+    assert "uid=" in report and "gid=" in report
+    assert "dir_writable=True" in report
+    assert "dir_exists=True" in report
+
+
+async def test_init_db_logs_diagnostics_before_raising(monkeypatch, caplog):
+    """Daca deschiderea bazei esueaza, eroarea nu pleaca 'goala': in log ramane
+    contextul necesar (cale, UID, permisiuni)."""
+    async def _boom():
+        raise db.aiosqlite.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(db, "_connect", _boom)
+
+    with caplog.at_level("ERROR", logger="betmind.db"):
+        with pytest.raises(db.aiosqlite.OperationalError):
+            await db.init_db()
+
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "Nu pot deschide baza de date" in logged
+    assert "db_path=" in logged and "uid=" in logged and "dir_writable=" in logged

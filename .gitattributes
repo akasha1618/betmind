@@ -1,0 +1,5 @@
+# Scripturile shell trebuie sa ajunga in container cu LF, chiar daca repo-ul
+# e editat pe Windows — cu CRLF, /bin/sh nu gaseste interpretorul.
+*.sh text eol=lf
+Dockerfile text eol=lf
+docker-entrypoint.sh text eol=lf
