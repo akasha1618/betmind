@@ -2,8 +2,6 @@
 
 Chatbot web care cercetează date reale despre meciuri (statistici, formă, accidentări, H2H, clasamente, cote) și construiește bilete cu reasoning transparent. Un singur agent Claude cu 9 tool-uri, conectat la API-Football.
 
-**Nume provizoriu:** „BetMind" e un placeholder — schimbă-l ușor în `static/index.html` și `prompts.py`.
-
 ---
 
 ## 1. Cerințe
