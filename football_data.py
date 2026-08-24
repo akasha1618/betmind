@@ -23,6 +23,8 @@ import logging
 import os
 import re
 import time
+from collections import OrderedDict, deque
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
@@ -75,6 +77,230 @@ class FootballDataError(Exception):
 
 class BudgetExhausted(FootballDataError):
     """Bugetul zilnic de request-uri API a fost atins. Cade pe baza locala."""
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic: vizibilitate pe esecurile API-Football (nu schimba comportamentul)
+#
+# Fara asta, orice esec de la /odds ajunge in data_gaps ca un singur sir de
+# text si nu se poate distinge un 429 real de un `errors.rateLimit` primit cu
+# status 200, de un timeout sau de bugetul zilnic epuizat.
+# ---------------------------------------------------------------------------
+
+# Headerele pe care API-Football le foloseste pentru cele DOUA limite diferite:
+# cea zilnica (requests-limit/remaining) si cea pe minut (RateLimit-*).
+_RATE_HEADERS = (
+    "x-ratelimit-requests-limit",      # cota zilnica a planului
+    "x-ratelimit-requests-remaining",  # cat a mai ramas azi
+    "x-ratelimit-limit",               # cota PE MINUT
+    "x-ratelimit-remaining",           # cat a mai ramas in minutul curent
+    "retry-after",
+)
+
+_MAX_RECENT_ERRORS = 100
+_recent_errors: deque[dict] = deque(maxlen=_MAX_RECENT_ERRORS)
+
+# Ultimele valori raportate de API (actualizate si la succes): asa vedem daca
+# ne apropiem de limita pe minut inainte sa inceapa esecurile.
+_last_rate_headers: dict = {}
+
+# Statistici per tura de chat: cate apeluri API s-au facut, cate au esuat si
+# cu ce fel de eroare. Turn-ul curent se propaga automat in task-urile
+# analistilor (asyncio copiaza contextul la crearea task-ului).
+_current_turn: ContextVar[Optional[str]] = ContextVar("betmind_api_turn", default=None)
+_MAX_TRACKED_TURNS = 50
+_turn_stats: "OrderedDict[str, dict]" = OrderedDict()
+
+
+def set_current_turn(turn_id: Optional[str]) -> None:
+    """Marcheaza tura careia i se atribuie apelurile API urmatoare."""
+    _current_turn.set(turn_id)
+
+
+def _turn_bucket() -> Optional[dict]:
+    turn_id = _current_turn.get()
+    if not turn_id:
+        return None
+    bucket = _turn_stats.get(turn_id)
+    if bucket is None:
+        bucket = {"turn_id": turn_id, "api_calls": 0, "cache_hits": 0,
+                  "failures": 0, "by_kind": {}, "by_status": {},
+                  "duration_s": 0.0, "endpoints": {}}
+        _turn_stats[turn_id] = bucket
+        while len(_turn_stats) > _MAX_TRACKED_TURNS:
+            _turn_stats.popitem(last=False)
+    return bucket
+
+
+def turn_api_stats(turn_id: str) -> dict:
+    """Ce s-a intamplat cu API-ul extern in tura data (pentru modul dezvoltator)."""
+    bucket = _turn_stats.get(turn_id)
+    if not bucket:
+        return {"api_calls": 0, "cache_hits": 0, "failures": 0,
+                "by_kind": {}, "by_status": {}, "duration_s": 0.0, "endpoints": {}}
+    return {
+        "api_calls": bucket["api_calls"],
+        "cache_hits": bucket["cache_hits"],
+        "failures": bucket["failures"],
+        "by_kind": dict(bucket["by_kind"]),
+        "by_status": dict(bucket["by_status"]),
+        "duration_s": round(bucket["duration_s"], 3),
+        "endpoints": dict(bucket["endpoints"]),
+    }
+
+
+def _errors_text(errors: Any) -> str:
+    if isinstance(errors, dict):
+        return " ".join(f"{k}={v}" for k, v in errors.items())
+    if isinstance(errors, list):
+        return " ".join(str(e) for e in errors)
+    return str(errors)
+
+
+def _looks_like_rate_limit(text: str) -> bool:
+    low = text.lower()
+    return "ratelimit" in low.replace(" ", "") or "too many requests" in low
+
+
+def _rate_headers(headers: Any) -> dict:
+    """Extrage headerele de ritm. httpx e case-insensitive, deci
+    X-RateLimit-Remaining si x-ratelimit-remaining sunt acelasi camp."""
+    if headers is None:
+        return {}
+    out = {}
+    for name in _RATE_HEADERS:
+        try:
+            value = headers.get(name)
+        except Exception:
+            value = None
+        if value is not None:
+            out[name.lower()] = value
+    # Orice alt header de ritm pe care nu l-am listat (proxy, CDN).
+    try:
+        items = headers.items()
+    except Exception:
+        items = []
+    for key, value in items:
+        low = str(key).lower()
+        if value is None or low in out:
+            continue
+        compact = low.replace("-", "")
+        if "ratelimit" in compact or low == "retry-after":
+            out[low] = value
+    return out
+
+
+def _note_call(endpoint: str, duration: float, cached: bool = False) -> None:
+    bucket = _turn_bucket()
+    if bucket is None:
+        return
+    if cached:
+        bucket["cache_hits"] += 1
+        return
+    bucket["api_calls"] += 1
+    bucket["duration_s"] += duration
+    bucket["endpoints"][endpoint] = bucket["endpoints"].get(endpoint, 0) + 1
+
+
+# Cat de zgomotos logam fiecare tip de esec. Bugetul epuizat se repeta la
+# FIECARE apel al fiecarui analist (zeci de linii identice) si e deja o stare
+# cunoscuta local — ramane in istoric si in /api/health, dar nu inunda logul.
+# Esecurile venite chiar de la API raman la WARNING: pe ele le cautam.
+_LOG_LEVELS = {
+    "budget_exhausted": logging.DEBUG,
+    "no_odds_data": logging.INFO,
+}
+
+
+def _record_api_error(endpoint: str, kind: str, status: Optional[int], body: str,
+                      headers: Any = None, params: Optional[dict] = None,
+                      duration: float = 0.0) -> None:
+    """Un singur loc unde esecurile devin vizibile: log structurat + istoric
+    scurt in memorie (citit de /api/health)."""
+    entry = {
+        "at": now_local().isoformat(timespec="seconds"),
+        "endpoint": endpoint,
+        "kind": kind,
+        "status": status,
+        "body": (body or "")[:200],
+        "headers": _rate_headers(headers),
+        "params": dict(params or {}),
+        "duration_s": round(duration, 3),
+        "turn_id": _current_turn.get(),
+    }
+    _recent_errors.append(entry)
+
+    bucket = _turn_bucket()
+    if bucket is not None:
+        bucket["failures"] += 1
+        bucket["by_kind"][kind] = bucket["by_kind"].get(kind, 0) + 1
+        key = str(status) if status is not None else "none"
+        bucket["by_status"][key] = bucket["by_status"].get(key, 0) + 1
+
+    log.log(
+        _LOG_LEVELS.get(kind, logging.WARNING),
+        "API-Football FAIL endpoint=%s kind=%s status=%s params=%s durata=%.2fs "
+        "headers=%s body=%r",
+        endpoint, kind, status, entry["params"], duration, entry["headers"], entry["body"],
+    )
+
+
+def recent_api_errors(endpoint: Optional[str] = None, hours: float = 1.0) -> list[dict]:
+    """Erorile din ultimele `hours` ore, optional filtrate pe endpoint."""
+    cutoff = now_local() - timedelta(hours=hours)
+    out = []
+    for e in _recent_errors:
+        if endpoint and e["endpoint"] != endpoint:
+            continue
+        try:
+            if datetime.fromisoformat(e["at"]) < cutoff:
+                continue
+        except ValueError:
+            pass
+        out.append(e)
+    return out
+
+
+def api_errors_grouped(endpoint: Optional[str] = None, hours: float = 1.0) -> dict[str, int]:
+    """Erorile grupate pe tip — raspunde la «ce fel de esec e, de fapt?»."""
+    grouped: dict[str, int] = {}
+    for e in recent_api_errors(endpoint, hours):
+        grouped[e["kind"]] = grouped.get(e["kind"], 0) + 1
+    return grouped
+
+
+def last_api_error(endpoint: Optional[str] = None) -> Optional[dict]:
+    for e in reversed(_recent_errors):
+        if endpoint is None or e["endpoint"] == endpoint:
+            return e
+    return None
+
+
+def last_rate_headers() -> dict:
+    """Ultimele headere de ritm vazute (si la succes, nu doar la esec) — arata
+    cat de aproape suntem de limita PE MINUT a planului."""
+    return dict(_last_rate_headers)
+
+
+def rate_limit_per_minute() -> Optional[int]:
+    """Limita pe minut CONFIGURATA (env). None = nimic configurat."""
+    raw = os.environ.get("API_FOOTBALL_RATE_LIMIT_PER_MINUTE", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def rate_limiter_active() -> bool:
+    """Exista un limitator de ritm care chiar intarzie apelurile?
+
+    Deocamdata NU: singurul control de debit din aplicatie este
+    Semaphore(MAX_PARALLEL_ANALYSTS), care limiteaza cati analisti ruleaza
+    simultan, nu cate cereri HTTP pleaca intr-un minut.
+    """
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +375,7 @@ async def _get(endpoint: str, params: dict, ttl_key: str) -> Any:
     async with _cache_lock:
         hit = _cache.get(cache_id)
         if hit and hit[0] > time.time():
+            _note_call(endpoint, 0.0, cached=True)
             return hit[1]
 
     # Budget guard: doar request-urile HTTP reale consuma buget.
@@ -156,21 +383,39 @@ async def _get(endpoint: str, params: dict, ttl_key: str) -> Any:
     budget_day = today_local().isoformat()
     used = await db.budget_get(budget_day)
     if used >= limit:
+        _record_api_error(endpoint, "budget_exhausted", None,
+                          f"buget zilnic local: {used}/{limit} folosite azi", None, params)
         raise BudgetExhausted(
             f"Bugetul zilnic de {limit} request-uri API-Football a fost epuizat "
             f"({used} folosite azi). Raspund din baza locala."
         )
 
     headers = {"x-apisports-key": _api_key()}
+    started = time.monotonic()
     try:
         resp = await _http_get(endpoint, params, headers)
     except httpx.HTTPError as e:
-        raise FootballDataError(f"Nu am putut contacta API-Football: {e}") from e
+        kind = "timeout" if isinstance(e, httpx.TimeoutException) else "network_error"
+        _record_api_error(endpoint, kind, None, f"{type(e).__name__}: {e}", None, params,
+                          time.monotonic() - started)
+        raise FootballDataError(f"[{kind}] Nu am putut contacta API-Football: {e}") from e
 
+    elapsed = time.monotonic() - started
+    _note_call(endpoint, elapsed)
+    seen = _rate_headers(resp.headers)
+    if seen:
+        _last_rate_headers.clear()
+        _last_rate_headers.update(seen)
+        _last_rate_headers["at"] = now_local().isoformat(timespec="seconds")
     used = await db.budget_add(budget_day, 1)
 
     if resp.status_code != 200:
-        raise FootballDataError(f"API-Football a raspuns cu status {resp.status_code}: {resp.text[:200]}")
+        kind = {429: "http_429_rate_limit", 403: "http_403_forbidden",
+                499: "http_499"}.get(resp.status_code, f"http_{resp.status_code}")
+        _record_api_error(endpoint, kind, resp.status_code, resp.text,
+                          resp.headers, params, elapsed)
+        raise FootballDataError(
+            f"[{kind}] API-Football a raspuns cu status {resp.status_code}: {resp.text[:200]}")
 
     # Cross-check cu headerele de rate limit raportate de API.
     _requests_remaining = resp.headers.get("x-ratelimit-requests-remaining", _requests_remaining)
@@ -183,10 +428,25 @@ async def _get(endpoint: str, params: dict, ttl_key: str) -> Any:
         except ValueError:
             pass
 
-    data = resp.json()
+    try:
+        data = resp.json()
+    except Exception as e:
+        # Corp care nu e JSON (pagina de eroare a proxy-ului, HTML de la CDN...).
+        _record_api_error(endpoint, "invalid_json", resp.status_code, resp.text,
+                          resp.headers, params, elapsed)
+        raise  # tipul exceptiei ramane neschimbat — doar am facut-o vizibila
+
     errors = data.get("errors")
     if errors:  # poate fi dict sau lista; gol inseamna OK
-        raise FootballDataError(f"API-Football a returnat erori: {errors}")
+        # Cazul perfid: HTTP 200, dar in corp scrie ca ai depasit limita PE MINUT.
+        # Nu etichetam totul «rate limit»: doar daca textul chiar spune asta.
+        text = _errors_text(errors)
+        extra = data.get("message")
+        if extra:
+            text = f"{text} | message={extra}"
+        kind = "rate_limit_in_body" if _looks_like_rate_limit(text) else "api_errors_in_body"
+        _record_api_error(endpoint, kind, resp.status_code, text, resp.headers, params, elapsed)
+        raise FootballDataError(f"[{kind}] API-Football a returnat erori: {errors}")
 
     payload = data.get("response", [])
     async with _cache_lock:
@@ -955,6 +1215,10 @@ async def get_odds(fixture_id: int) -> dict:
     plus `markets` agregat pe toate casele (avg/best/n_books)."""
     raw = await _get("/odds", {"fixture": fixture_id}, "odds")
     if not raw:
+        # Nu e o eroare de API, dar in diagnostic trebuie sa se vada distinct:
+        # «nu exista cote» arata altfel decat «am fost limitat».
+        _record_api_error("/odds", "no_odds_data", 200, "response=[] (fara cote publicate)",
+                          None, {"fixture": fixture_id})
         return {"error": "Nu exista cote pentru acest meci (posibil prea devreme sau liga neacoperita)."}
     books = raw[0].get("bookmakers") or []
     try:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
+from typing import Any, Optional
 
 import httpx
 import pytest
@@ -39,6 +40,12 @@ def isolated_env(tmp_path, monkeypatch):
     fd._cache.clear()
     fd._cache_lock = asyncio.Lock()  # lock nou — loop nou per test
     fd._requests_remaining = None
+    # Diagnosticul API (istoric erori + statistici per tura) e la nivel de modul:
+    # fara golire, testele s-ar vedea unele pe altele.
+    fd._recent_errors.clear()
+    fd._turn_stats.clear()
+    fd._last_rate_headers.clear()
+    fd.set_current_turn(None)
     yield
 
 
@@ -65,12 +72,18 @@ class FakeHTTP:
         self.calls: list[tuple[str, dict]] = []
         self.response_payload: list[dict] = []
         self.headers: dict[str, str] = {}
+        # Pentru testele de diagnostic: status non-200 sau corp cu `errors`.
+        self.status_code: int = 200
+        self.errors: Any = []
+        self.text_body: Optional[str] = None
 
     async def __call__(self, endpoint: str, params: dict, headers: dict) -> httpx.Response:
         self.calls.append((endpoint, dict(params)))
+        if self.text_body is not None:
+            return httpx.Response(self.status_code, text=self.text_body, headers=self.headers)
         return httpx.Response(
-            200,
-            json={"errors": [], "response": self.response_payload},
+            self.status_code,
+            json={"errors": self.errors, "response": self.response_payload},
             headers=self.headers,
         )
 

@@ -249,6 +249,17 @@ async def health():
         # V1-D: persistenta conversatiilor + feedback
         "conversations_count": await db.count_conversations(),
         "feedback_count": await db.count_feedback(),
+        # Diagnostic API-Football: de ce esueaza cererile de cote in productie.
+        "odds_errors_last_hour": fd.api_errors_grouped("/odds", hours=1),
+        "api_errors_last_hour": fd.api_errors_grouped(hours=1),
+        "last_odds_error": fd.last_api_error("/odds"),
+        "last_api_error": fd.last_api_error(),
+        "rate_limit_per_minute": fd.rate_limit_per_minute(),
+        "rate_limiter_active": fd.rate_limiter_active(),
+        "last_rate_headers": fd.last_rate_headers(),
+        "max_parallel_analysts": analysts.max_parallel_analysts(),
+        "odds_cache_entries": sum(1 for k in fd._cache if k.startswith("/odds")),
+        "cache_entries": len(fd._cache),
     }
 
 
@@ -378,6 +389,9 @@ async def chat(req: ChatRequest):
     first_turn = len(history) == 1
 
     async def event_stream():
+        # Diagnostic: apelurile API-Football din aceasta tura (inclusiv cele
+        # facute de analistii din task-uri paralele) se contorizeaza pe turn_id.
+        fd.set_current_turn(turn_id)
         # Contract SSE compatibil: eveniment nou aditiv "meta" (clientii vechi
         # ignora tipurile necunoscute).
         yield _sse({"type": "meta", "conversation_id": conv_id, "turn_id": turn_id,
@@ -397,7 +411,8 @@ async def chat(req: ChatRequest):
             # Costul turei (pentru modul dezvoltator din interfata).
             with contextlib.suppress(Exception):
                 yield _sse({"type": "usage", "turn_id": turn_id,
-                            **pricing.summarize(await db.usage_for_turn(turn_id))})
+                            **pricing.summarize(await db.usage_for_turn(turn_id)),
+                            "api": fd.turn_api_stats(turn_id)})
         except Exception as e:
             log.exception("Chat stream failed")
             yield _sse({"type": "error", "message": f"Eroare de server: {type(e).__name__}: {e}"})
@@ -494,9 +509,11 @@ async def config():
 
 @app.get("/api/usage/{turn_id}")
 async def usage(turn_id: str):
-    """Costul unei ture (toate apelurile Claude cu acelasi turn_id)."""
+    """Costul unei ture (toate apelurile Claude cu acelasi turn_id) plus ce s-a
+    intamplat cu API-Football in tura respectiva (diagnostic pentru modul dev)."""
     rows = await db.usage_for_turn(turn_id)
-    return {"turn_id": turn_id, **pricing.summarize(rows)}
+    return {"turn_id": turn_id, **pricing.summarize(rows),
+            "api": fd.turn_api_stats(turn_id)}
 
 
 @app.post("/api/feedback")
