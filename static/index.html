@@ -102,9 +102,10 @@
   footer{border-top:1px solid var(--line); background:rgba(7,13,9,.94); z-index:5;
     padding:10px 14px calc(env(safe-area-inset-bottom) + 10px)}
   .inputrow{max-width:760px; margin:0 auto; display:flex; gap:9px; align-items:flex-end}
+  textarea, input, select{font-size:16px}
   textarea{
     flex:1; resize:none; background:var(--surface); border:1px solid var(--line); color:var(--text);
-    border-radius:12px; padding:11px 14px; font:15px/1.4 inherit; max-height:130px; outline:none;
+    border-radius:12px; padding:11px 14px; font:16px/1.4 inherit; max-height:130px; outline:none;
   }
   textarea:focus-visible{border-color:var(--green)}
   #send{
@@ -192,7 +193,7 @@
   .editbox{align-self:flex-end; width:min(92%,560px); display:flex; flex-direction:column; gap:8px;
     background:var(--surface); border:1px solid var(--green); border-radius:var(--radius); padding:10px}
   .editbox textarea{width:100%; min-height:64px; background:var(--surface-2); border:1px solid var(--line);
-    color:var(--text); border-radius:10px; padding:9px 11px; font:15px/1.4 inherit; resize:vertical; outline:none}
+    color:var(--text); border-radius:10px; padding:9px 11px; font:16px/1.4 inherit; resize:vertical; outline:none}
   .editbox .row{display:flex; gap:8px; justify-content:flex-end}
   .editbox button{border-radius:9px; padding:6px 14px; font-size:13px; cursor:pointer;
     border:1px solid var(--line); background:transparent; color:var(--muted)}
@@ -323,12 +324,12 @@
     <span class="hint" id="modeHint">analiză standard, mai rapidă</span>
     <span class="hint hidden" id="devFlag" style="margin-left:auto;color:var(--amber)">mod dezvoltator</span>
   </div>
-  <div class="inputrow">
-    <textarea id="input" rows="1" placeholder="Scrie cererea ta… (Enter pentru trimitere)" aria-label="Mesaj"></textarea>
-    <button id="send" aria-label="Trimite">
+  <form id="composer" class="inputrow" action="#" method="post">
+    <textarea id="input" rows="1" placeholder="Scrie cererea ta… (Enter pentru trimitere)" aria-label="Mesaj" enterkeyhint="send" autocomplete="off"></textarea>
+    <button type="submit" id="send" aria-label="Trimite">
       <svg id="sendIco" width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><use href="#ico-send"/></svg>
     </button>
-  </div>
+  </form>
   <div class="legal"><b>18+</b> · Recomandările nu garantează câștiguri · Pariază responsabil · jocresponsabil.ro</div>
 </footer>
 
@@ -340,7 +341,7 @@ const thread = $("#thread"), chat = $("#chat"), input = $("#input"), sendBtn = $
 /* ---- age gate ---- */
 const gate = $("#gate");
 if (localStorage.getItem("betmind_18plus") !== "yes") gate.classList.remove("hidden");
-$("#gate-yes").onclick = () => { localStorage.setItem("betmind_18plus", "yes"); gate.classList.add("hidden"); input.focus(); };
+$("#gate-yes").onclick = () => { localStorage.setItem("betmind_18plus", "yes"); gate.classList.add("hidden"); maybeFocusInput(); };
 $("#gate-no").onclick = () => {
   gate.querySelector(".card").innerHTML =
     "<h3>Ne pare rău</h3><p>BetMind este disponibil doar persoanelor de peste 18 ani.</p>";
@@ -395,6 +396,12 @@ function addUserMessage(text) {
 
 let streaming = false;
 let controller = null;   // permite oprirea raspunsului in curs
+let inflight = null;     // tura in curs: reconectare dupa background Safari
+
+function isMobileUi() {
+  return window.matchMedia("(max-width: 720px), (pointer: coarse)").matches;
+}
+function maybeFocusInput() { if (!isMobileUi()) input.focus(); }
 
 function setSending(on) {
   streaming = on;
@@ -404,7 +411,45 @@ function setSending(on) {
 }
 
 function stopStreaming() {
+  if (inflight) inflight.stopped = true;
+  if (inflight && inflight.turnId) {
+    fetch("/api/turns/" + encodeURIComponent(inflight.turnId) + "/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_key: sessionId }),
+    }).catch(() => {});
+  }
   if (controller) controller.abort();
+}
+
+function isSendKey(e) {
+  if (e.isComposing || e.keyCode === 229) return false;
+  if (e.shiftKey) return false;
+  return e.key === "Enter" || e.key === "Go" || e.key === "Send"
+      || e.code === "Enter" || e.keyCode === 13;
+}
+
+async function readSse(resp, onEvent) {
+  if (!resp.ok || !resp.body) throw new Error("HTTP " + resp.status);
+  if (inflight) inflight.reading = true;
+  try {
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let pending = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      pending += decoder.decode(value, { stream: true });
+      const lines = pending.split("\n\n");
+      pending = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        onEvent(JSON.parse(line.slice(6)));
+      }
+    }
+  } finally {
+    if (inflight) inflight.reading = false;
+  }
 }
 
 async function send(text, opts) {
@@ -423,8 +468,92 @@ async function send(text, opts) {
   let bubble = null, buffer = "", stopped = false, turnId = null;
   const turnBubbles = [];
   const setStatus = l => { status.querySelector(".label").textContent = l; status.classList.remove("hidden"); };
+  let complete = false;
+  let eventCount = 0;
+
+  const applyEvent = ev => {
+    eventCount += 1;
+    if (inflight) inflight.eventCount = eventCount;
+    if (ev.type === "delta") {
+      if (!bubble) {
+        bubble = el("div", "msg bot");
+        if (turnId) bubble.dataset.turn = turnId;
+        turnBubbles.push(bubble);
+        thread.appendChild(bubble);
+        reindex();
+      }
+      status.classList.add("hidden");
+      buffer += ev.text;
+      bubble.innerHTML = md(buffer);
+      scrollDown();
+    } else if (ev.type === "snapshot") {
+      if (!bubble) {
+        bubble = el("div", "msg bot");
+        if (turnId) bubble.dataset.turn = turnId;
+        turnBubbles.push(bubble);
+        thread.appendChild(bubble);
+        reindex();
+      }
+      status.classList.add("hidden");
+      buffer = ev.text || "";
+      bubble.innerHTML = md(buffer);
+      scrollDown();
+    } else if (ev.type === "meta") {
+      conversationId = ev.conversation_id || conversationId;
+      turnId = ev.turn_id || turnId;
+      if (inflight) { inflight.turnId = turnId; inflight.conversationId = conversationId; }
+      if (ev.premium_required) showPremiumNotice();
+    } else if (ev.type === "status") {
+      bubble = null; buffer && (buffer = "");
+      setStatus(ev.label);
+      scrollDown();
+    } else if (ev.type === "usage") {
+      if (devMode) showCost(ev);
+    } else if (ev.type === "error") {
+      complete = true;
+      thread.appendChild(el("div", "error", DOMPurify.sanitize(ev.message)));
+    } else if (ev.type === "done") {
+      complete = true;
+    }
+  };
+
+  async function resumeFrom(after) {
+    if (!turnId) return;
+    setStatus("Reconectez…");
+    const resp = await fetch(
+      "/api/turns/" + encodeURIComponent(turnId) + "/stream?after=" + after
+        + "&user_key=" + encodeURIComponent(sessionId),
+      { signal: controller.signal });
+    if (resp.status === 401) { location.href = "/login"; return; }
+    if (resp.status === 404) {
+      if (conversationId) await loadConversation(conversationId);
+      complete = true;
+      return;
+    }
+    await readSse(resp, applyEvent);
+  }
 
   controller = new AbortController();
+  inflight = { turnId: null, conversationId, eventCount: 0, stopped: false, reading: false, resuming: false,
+               reconnect: async () => {
+                 if (!inflight || inflight.stopped || complete || inflight.resuming) return;
+                 inflight.resuming = true;
+                 try {
+                   for (let attempt = 0; attempt < 3 && inflight && !inflight.stopped && !complete; attempt++) {
+                     try {
+                       controller = new AbortController();
+                       await resumeFrom(eventCount);
+                       return;
+                     } catch (err) {
+                       if (err && err.name === "AbortError" && inflight && inflight.stopped) throw err;
+                       if (err && err.name === "AbortError") continue;
+                       throw err;
+                     }
+                   }
+                 } finally {
+                   if (inflight) inflight.resuming = false;
+                 }
+               } };
   try {
     const body = { message: text, conversation_id: conversationId, user_key: sessionId,
                    mode: advancedMode ? "advanced" : "standard" };
@@ -435,71 +564,56 @@ async function send(text, opts) {
       body: JSON.stringify(body),
       signal: controller.signal,
     });
-    if (resp.status === 401) { location.href = "/login"; return; }  // sesiune expirată → poarta de acces
-    if (!resp.ok || !resp.body) throw new Error("HTTP " + resp.status);
-
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let pending = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      pending += decoder.decode(value, { stream: true });
-      const lines = pending.split("\n\n");
-      pending = lines.pop();
-      for (const line of lines) {
-        if (!line.startsWith("data: ")) continue;
-        const ev = JSON.parse(line.slice(6));
-        if (ev.type === "delta") {
-          if (!bubble) {
-            bubble = el("div", "msg bot");
-            if (turnId) bubble.dataset.turn = turnId;   // pentru costul din modul dev
-            turnBubbles.push(bubble);
-            thread.appendChild(bubble);
-            reindex();
-          }
-          status.classList.add("hidden");
-          buffer += ev.text;
-          bubble.innerHTML = md(buffer);
-          scrollDown();
-        } else if (ev.type === "meta") {
-          conversationId = ev.conversation_id;
-          turnId = ev.turn_id;
-          if (ev.premium_required) showPremiumNotice();
-        } else if (ev.type === "status") {
-          bubble = null; buffer && (buffer = "");  // urmatorul text = bula noua
-          setStatus(ev.label);
-          scrollDown();
-        } else if (ev.type === "usage") {
-          if (devMode) showCost(ev);
-        } else if (ev.type === "error") {
-          thread.appendChild(el("div", "error", DOMPurify.sanitize(ev.message)));
-        }
-      }
-    }
+    if (resp.status === 401) { location.href = "/login"; return; }
+    turnId = resp.headers.get("X-Turn-Id") || turnId;
+    conversationId = resp.headers.get("X-Conversation-Id") || conversationId;
+    inflight.turnId = turnId;
+    inflight.conversationId = conversationId;
+    await readSse(resp, applyEvent);
+    if (!complete && turnId && !inflight.stopped) await inflight.reconnect();
   } catch (e) {
-    if (e && e.name === "AbortError") {
+    if (e && e.name === "AbortError" && inflight && inflight.stopped) {
       stopped = true;
       if (bubble) bubble.appendChild(el("div", "stopmark", "răspuns oprit"));
-    } else {
+    } else if (turnId && inflight && !inflight.stopped) {
+      try {
+        await inflight.reconnect();
+      } catch (e2) {
+        if (e2 && e2.name === "AbortError" && inflight && inflight.stopped) {
+          stopped = true;
+          if (bubble) bubble.appendChild(el("div", "stopmark", "răspuns oprit"));
+        } else {
+          thread.appendChild(el("div", "error", "Nu am putut contacta serverul. Verifică dacă aplicația rulează."));
+        }
+      }
+    } else if (!(e && e.name === "AbortError")) {
       thread.appendChild(el("div", "error", "Nu am putut contacta serverul. Verifică dacă aplicația rulează."));
     }
   } finally {
     controller = null;
+    inflight = null;
     status.remove();
-    // feedback sub raspunsurile care contin un bilet
     turnBubbles.forEach(b => { if (isTicketText(b.textContent)) addFeedback(b); });
     reindex();
     setSending(false);
-    // la oprire mai asteptam putin: ultimul apel se contorizeaza pe server
     if (devMode && turnId) setTimeout(() => refreshCost(turnId), stopped ? 1200 : 0);
-    scrollDown(); input.focus();
-    // titlul se genereaza in fundal dupa raspuns, deci mai verificam o data
+    scrollDown(); maybeFocusInput();
     refreshConvList();
     setTimeout(refreshConvList, 2500);
   }
 }
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible" || !inflight || inflight.stopped) return;
+  /* iOS ține fetch-ul zombie în background: întrerupem citirea și reluăm tura. */
+  if (inflight.resuming) return;
+  if (inflight.reading && controller) {
+    try { controller.abort(); } catch (e) {}
+  } else if (inflight.reconnect) {
+    inflight.reconnect();
+  }
+});
+
 
 /* ---- editarea unui mesaj deja trimis ---- */
 function startEdit(bubble) {
@@ -702,7 +816,7 @@ function newChat() {
   if (streaming) stopStreaming();
   conversationId = null;
   thread.innerHTML = emptyHTML;
-  input.focus();
+  maybeFocusInput();
 }
 
 async function refreshConvList() {
@@ -757,7 +871,7 @@ async function loadConversation(id) {
     }
     reindex();
     if (devMode) renderCosts();
-    scrollDown(); input.focus();
+    scrollDown(); maybeFocusInput();
   } catch (e) {}
 }
 
@@ -765,11 +879,15 @@ async function loadConversation(id) {
 function autosize() { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 130) + "px"; }
 input.addEventListener("input", autosize);
 input.addEventListener("keydown", e => {
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(input.value); }
+  if (isSendKey(e)) { e.preventDefault(); send(input.value); }
 });
-// acelasi buton: trimite cand e liber, opreste raspunsul cat timp scrie
-sendBtn.addEventListener("click", () => { streaming ? stopStreaming() : send(input.value); });
-// delegare: functioneaza si dupa ce empty state-ul e re-injectat de "Conversație nouă"
+$("#composer").addEventListener("submit", e => {
+  e.preventDefault();
+  if (!streaming) send(input.value);
+});
+sendBtn.addEventListener("click", e => {
+  if (streaming) { e.preventDefault(); stopStreaming(); }
+});
 thread.addEventListener("click", e => { const c = e.target.closest(".chip"); if (c) send(c.textContent); });
 </script>
 </body>

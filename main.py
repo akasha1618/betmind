@@ -50,6 +50,7 @@ import football_data as fd
 import pricing
 import sync
 import titles
+import turns
 
 BASE_DIR = Path(__file__).parent
 DEBUG = os.environ.get("DEBUG", "").strip().lower() in ("1", "true", "yes")
@@ -387,49 +388,139 @@ async def chat(req: ChatRequest):
     history.append({"role": "user", "content": text})
     await db.append_messages(conv_id, [{"role": "user", "content": text}], now)
     first_turn = len(history) == 1
+    start_len = len(history)
 
-    async def event_stream():
-        # Diagnostic: apelurile API-Football din aceasta tura (inclusiv cele
-        # facute de analistii din task-uri paralele) se contorizeaza pe turn_id.
-        fd.set_current_turn(turn_id)
-        # Contract SSE compatibil: eveniment nou aditiv "meta" (clientii vechi
-        # ignora tipurile necunoscute).
-        yield _sse({"type": "meta", "conversation_id": conv_id, "turn_id": turn_id,
-                    "mode": active_mode or analysts.orchestration_mode(),
-                    "premium_required": premium_required})
-        start_len = len(history)
-        partial: list[str] = []
-        try:
-            async for event in agent.run_turn(history, conversation_id=conv_id,
-                                              user_key=user_key, mode=active_mode,
-                                              turn_id=turn_id):
-                if event.get("type") == "delta":
-                    partial.append(event.get("text", ""))
-                elif event.get("type") == "error":
-                    log.error("Chat error event: %s", event.get("message"))
-                yield _sse(event)
-            # Costul turei (pentru modul dezvoltator din interfata).
-            with contextlib.suppress(Exception):
-                yield _sse({"type": "usage", "turn_id": turn_id,
-                            **pricing.summarize(await db.usage_for_turn(turn_id)),
-                            "api": fd.turn_api_stats(turn_id)})
-        except Exception as e:
-            log.exception("Chat stream failed")
-            yield _sse({"type": "error", "message": f"Eroare de server: {type(e).__name__}: {e}"})
-        finally:
-            # Write-through, protejat de anulare: daca utilizatorul apasa Stop,
-            # conexiunea moare, dar ce s-a produs pana atunci tot se salveaza.
-            task = asyncio.create_task(_persist_turn(
-                conv_id, history, start_len, "".join(partial),
-                first_turn, text, turn_id))
-            with contextlib.suppress(Exception):
-                await asyncio.shield(task)
+    turn = turns.hub.create(turn_id, conv_id, user_key)
+    turn.task = asyncio.create_task(_produce_turn(
+        turn, history, start_len, first_turn, text, active_mode,
+        premium_required, conv_id, user_key, turn_id))
+    _BACKGROUND.add(turn.task)
+    turn.task.add_done_callback(_BACKGROUND.discard)
 
     return StreamingResponse(
-        event_stream(),
+        _consume_turn(turn, after=0),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "X-Turn-Id": turn_id,
+            "X-Conversation-Id": conv_id,
+            "Access-Control-Expose-Headers": "X-Turn-Id, X-Conversation-Id",
+        },
     )
+
+
+async def _produce_turn(turn: turns.Turn, history: list[dict], start_len: int,
+                        first_turn: bool, user_text: str, active_mode: Optional[str],
+                        premium_required: bool, conv_id: str, user_key: str,
+                        turn_id: str) -> None:
+    """Ruleaza tura independent de conexiunea SSE (Safari in background)."""
+    fd.set_current_turn(turn_id)
+    partial: list[str] = []
+    try:
+        await turn.publish({
+            "type": "meta", "conversation_id": conv_id, "turn_id": turn_id,
+            "mode": active_mode or analysts.orchestration_mode(),
+            "premium_required": premium_required,
+        })
+        async for event in agent.run_turn(history, conversation_id=conv_id,
+                                          user_key=user_key, mode=active_mode,
+                                          turn_id=turn_id):
+            if event.get("type") == "delta":
+                partial.append(event.get("text", ""))
+            elif event.get("type") == "error":
+                log.error("Chat error event: %s", event.get("message"))
+            await turn.publish(event)
+        with contextlib.suppress(Exception):
+            await turn.publish({
+                "type": "usage", "turn_id": turn_id,
+                **pricing.summarize(await db.usage_for_turn(turn_id)),
+                "api": fd.turn_api_stats(turn_id),
+            })
+    except asyncio.CancelledError:
+        if turn.cancel_requested:
+            log.info("Turn %s oprimita de client", turn_id)
+        else:
+            log.warning("Turn %s anulata neasteptat — persistam ce avem", turn_id)
+        raise
+    except Exception as e:
+        log.exception("Chat turn failed")
+        await turn.publish({"type": "error",
+                            "message": f"Eroare de server: {type(e).__name__}: {e}"})
+    finally:
+        try:
+            await _persist_turn(conv_id, history, start_len, "".join(partial),
+                                first_turn, user_text, turn_id)
+        except Exception:
+            log.exception("Persistarea turei %s a esuat", turn_id)
+        kinds = {e.get("type") for e in turn.events}
+        if "done" not in kinds and "error" not in kinds:
+            await turn.publish({"type": "done"})
+        await turn.finish()
+
+
+async def _consume_turn(turn: turns.Turn, after: int = 0):
+    async for event in turn.subscribe(after):
+        yield _sse(event)
+
+
+async def _replay_turn_from_db(turn_id: str):
+    rows = await db.messages_by_turn(turn_id)
+    conv_id = rows[0]["conversation_id"] if rows else ""
+    text = ""
+    for m in rows:
+        if m["role"] != "assistant" or not isinstance(m["content"], list):
+            continue
+        text += "".join(b.get("text", "") for b in m["content"]
+                        if isinstance(b, dict) and b.get("type") == "text")
+    yield _sse({"type": "meta", "conversation_id": conv_id, "turn_id": turn_id,
+                "mode": analysts.orchestration_mode(), "premium_required": False,
+                "replay": True})
+    if text.strip():
+        yield _sse({"type": "snapshot", "text": text.strip()})
+    else:
+        yield _sse({"type": "error",
+                    "message": "Tura s-a incheiat inainte sa avem un raspuns salvat."})
+    yield _sse({"type": "done"})
+
+
+@app.get("/api/turns/{turn_id}/stream")
+async def resume_turn(turn_id: str, after: int = 0, user_key: str = "anon"):
+    """Reia SSE-ul unei ture in curs (sau replay din DB daca s-a incheiat)."""
+    key = (user_key or "anon").strip() or "anon"
+    turn = turns.hub.get(turn_id)
+    if turn is not None:
+        if turn.user_key != key:
+            raise HTTPException(status_code=404, detail="Tura nu există.")
+        return StreamingResponse(
+            _consume_turn(turn, after=after),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                     "X-Turn-Id": turn_id,
+                     "X-Conversation-Id": turn.conversation_id},
+        )
+    rows = await db.messages_by_turn(turn_id)
+    if not rows:
+        raise HTTPException(status_code=404, detail="Tura nu există.")
+    conv = await db.get_conversation(rows[0]["conversation_id"])
+    if conv and conv.get("user_key") and conv["user_key"] != key:
+        raise HTTPException(status_code=404, detail="Tura nu există.")
+    return StreamingResponse(
+        _replay_turn_from_db(turn_id),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                 "X-Turn-Id": turn_id},
+    )
+
+
+@app.post("/api/turns/{turn_id}/cancel")
+async def cancel_turn(turn_id: str, req: Request):
+    body = {}
+    with contextlib.suppress(Exception):
+        body = await req.json()
+    user_key = str((body or {}).get("user_key") or "anon").strip() or "anon"
+    ok = turns.hub.cancel(turn_id, user_key)
+    return {"ok": ok}
 
 
 def _render_messages(msgs: list[dict]) -> list[dict]:

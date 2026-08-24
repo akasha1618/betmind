@@ -779,6 +779,29 @@ async def append_messages(conversation_id: str, msgs: list[dict], now: str,
         await conn.close()
 
 
+async def messages_by_turn(turn_id: str) -> list[dict]:
+    """Mesajele unei ture (pentru reconectare dupa ce hub-ul in-memory a expirat)."""
+    import json as _json
+    conn = await _connect()
+    try:
+        cur = await conn.execute(
+            "SELECT conversation_id, role, content_json, turn_id FROM messages "
+            "WHERE turn_id = ? ORDER BY id",
+            (turn_id,),
+        )
+        out = []
+        for r in await cur.fetchall():
+            out.append({
+                "conversation_id": r["conversation_id"],
+                "role": r["role"],
+                "content": _json.loads(r["content_json"]),
+                "turn_id": r["turn_id"],
+            })
+        return out
+    finally:
+        await conn.close()
+
+
 async def get_messages(conversation_id: str, with_turn_id: bool = False) -> list[dict]:
     """Istoricul complet al conversatiei, gata de trimis modelului."""
     import json as _json

@@ -30,6 +30,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 import db
 import football_data as fd
+from llm_compat import messages_create
 
 log = logging.getLogger("betmind.analysts")
 
@@ -740,22 +741,35 @@ _ANALYSIS_TOOL = {
 }
 
 
+def analyst_llm_create_kwargs(model: str = "dummy", max_tokens: int = 1,
+                              system: str = "s",
+                              user_content: str = "x") -> dict:
+    """Parametrii exacti trimisi la messages.create — testati fata de SDK."""
+    return {
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "system": system,
+        "messages": [{"role": "user", "content": user_content}],
+        "tools": [_ANALYSIS_TOOL],
+        "tool_choice": {"type": "tool", "name": "submit_match_analysis"},
+    }
+
+
 async def _call_analyst_llm(system: str, user_content: str) -> tuple[str, Any, str]:
     """UN apel Claude (analyst). Intoarce (text, usage, stop_reason).
 
     Forteaza JSON prin tool_choice (echivalentul structured output la Claude).
     Mock-urile din teste pot intoarce in continuare (text, usage).
+    temperature e optional: SDK-urile vechi nu il au — vezi llm_compat.
     """
     client = AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", "").strip())
-    msg = await client.messages.create(
+    msg = await messages_create(client, **analyst_llm_create_kwargs(
         model=analyst_model(),
         max_tokens=analyst_max_tokens(),
-        temperature=0,
         system=system,
-        messages=[{"role": "user", "content": user_content}],
-        tools=[_ANALYSIS_TOOL],
-        tool_choice={"type": "tool", "name": "submit_match_analysis"},
-    )
+        user_content=user_content,
+    ))
     stop_reason = getattr(msg, "stop_reason", None) or ""
     text = ""
     for block in msg.content:
