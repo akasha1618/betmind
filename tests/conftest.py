@@ -45,7 +45,10 @@ def isolated_env(tmp_path, monkeypatch):
     fd._recent_errors.clear()
     fd._turn_stats.clear()
     fd._last_rate_headers.clear()
+    fd._inflight.clear()
     fd.set_current_turn(None)
+    import analysts
+    analysts._league_packs.set(None)
     yield
 
 

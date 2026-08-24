@@ -68,6 +68,8 @@ TTL = {
 
 _cache: dict[str, tuple[float, Any]] = {}
 _cache_lock = asyncio.Lock()
+# Single-flight: cereri identice (endpoint+params) in zbor partajeaza UN request.
+_inflight: dict[str, asyncio.Future] = {}
 _requests_remaining: Optional[str] = None  # raportat de API in headere
 
 
@@ -364,19 +366,58 @@ async def _http_get(endpoint: str, params: dict, headers: dict) -> httpx.Respons
         return await client.get(f"{BASE_URL}{endpoint}", params=params, headers=headers)
 
 
+def _cache_id(endpoint: str, params: dict) -> str:
+    return endpoint + "|" + "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+
+
 async def _get(endpoint: str, params: dict, ttl_key: str) -> Any:
     """
-    GET cu cache TTL si buget zilnic. Cache hit = zero cost.
+    GET cu cache TTL, single-flight si buget zilnic. Cache hit = zero cost.
+    Daca un apel identic e deja in zbor, asteptam rezultatul lui (zero HTTP).
     Ridica BudgetExhausted la limita, FootballDataError la alte probleme.
     """
-    global _requests_remaining
-    cache_id = endpoint + "|" + "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    cache_id = _cache_id(endpoint, params)
 
     async with _cache_lock:
         hit = _cache.get(cache_id)
         if hit and hit[0] > time.time():
             _note_call(endpoint, 0.0, cached=True)
             return hit[1]
+        existing = _inflight.get(cache_id)
+        if existing is not None:
+            leader = False
+            fut = existing
+        else:
+            leader = True
+            fut = asyncio.get_running_loop().create_future()
+            # Marcheaza exceptia ca „citita" ca asyncio sa nu logheze
+            # „Future exception was never retrieved" cand liderul o ridica
+            # si nimeni nu astepta (sau asteptatorii au primit-o deja).
+            fut.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
+            _inflight[cache_id] = fut
+
+    if not leader:
+        _note_call(endpoint, 0.0, cached=True)
+        return await asyncio.shield(fut)
+
+    try:
+        payload = await _get_http(endpoint, params, ttl_key, cache_id)
+        if not fut.done():
+            fut.set_result(payload)
+        return payload
+    except Exception as e:
+        if not fut.done():
+            fut.set_exception(e)
+        raise
+    finally:
+        async with _cache_lock:
+            if _inflight.get(cache_id) is fut:
+                del _inflight[cache_id]
+
+
+async def _get_http(endpoint: str, params: dict, ttl_key: str, cache_id: str) -> Any:
+    """Cererea HTTP reala (un singur zbor per cache_id)."""
+    global _requests_remaining
 
     # Budget guard: doar request-urile HTTP reale consuma buget.
     limit = max_daily_requests()
@@ -850,12 +891,16 @@ async def get_h2h(team1_id: int, team2_id: int, last: int = 6) -> list[dict]:
     return out
 
 
-async def get_injuries(team_id: int, season: int) -> dict:
-    """Accidentari/suspendari recente (ultimele ~30 zile) pentru o echipa."""
-    raw = await _get("/injuries", {"team": team_id, "season": season}, "injuries")
+def _injuries_pack_from_raw(raw: list, team_id: Optional[int] = None) -> dict:
+    """Aceeasi forma pe care o vede analistul, indiferent daca raw-ul a venit
+    de la /injuries?team= sau de la /injuries?league= (filtrat pe echipa)."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=30)
     players: dict[str, dict] = {}
     for item in raw:
+        if team_id is not None:
+            item_team = ((item.get("team") or {}).get("id"))
+            if item_team != team_id:
+                continue
         fx_date = (item.get("fixture") or {}).get("date")
         if fx_date:
             try:
@@ -878,6 +923,24 @@ async def get_injuries(team_id: int, season: int) -> dict:
         "injuries": list(players.values())[:25],
         "note": "Date din ultimele ~30 zile; verifica importanta jucatorilor cu get_team_last_matches/stiri.",
     }
+
+
+async def get_injuries(team_id: int, season: int) -> dict:
+    """Accidentari/suspendari recente (ultimele ~30 zile) pentru o echipa."""
+    raw = await _get("/injuries", {"team": team_id, "season": season}, "injuries")
+    return _injuries_pack_from_raw(raw, team_id)
+
+
+async def get_league_injuries_by_team(league_id: int, season: int) -> dict[int, dict]:
+    """UN apel /injuries?league=&season= , grupat pe team_id. Aceeasi forma
+    per echipa ca get_injuries — ca assemble_data_pack sa nu schimbe pachetul."""
+    raw = await _get("/injuries", {"league": league_id, "season": season}, "injuries")
+    teams: set[int] = set()
+    for item in raw:
+        tid = (item.get("team") or {}).get("id")
+        if tid is not None:
+            teams.add(tid)
+    return {tid: _injuries_pack_from_raw(raw, tid) for tid in teams}
 
 
 async def get_standings(league_id: int, season: int) -> list[dict]:

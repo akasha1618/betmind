@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import os
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta
 from typing import Any, AsyncGenerator, Literal, Optional
 
@@ -32,6 +33,11 @@ import football_data as fd
 log = logging.getLogger("betmind.analysts")
 
 _EUROPEAN_LEAGUE_IDS = [2, 3, 848]  # UCL, UEL, UECL
+
+# Pachete comune de liga (standings + injuries), setate inainte de analisti.
+# assemble_data_pack le citeste; in afara lui analyze_matches raman apelurile
+# individuale (tool-uri classic / un singur meci).
+_league_packs: ContextVar[Optional[dict]] = ContextVar("betmind_league_packs", default=None)
 
 
 # ---------------------------------------------------------------------------
@@ -352,11 +358,54 @@ async def _midweek_european_game(team_id: int, kickoff_date: str,
     return bool(rows)
 
 
+async def prefetch_league_packs(fixture_ids: list[int]) -> dict:
+    """O singura pereche /standings + /injuries per (liga, sezon) din shortlist."""
+    keys: set[tuple[int, int]] = set()
+    for fid in fixture_ids:
+        fx = await db.get_fixture(fid)
+        if not fx:
+            continue
+        lid, season = fx.get("league_id"), fx.get("season")
+        if lid and season:
+            keys.add((int(lid), int(season)))
+
+    async def one(lid: int, season: int) -> tuple[tuple[int, int], dict]:
+        standings, st_err = None, None
+        try:
+            standings = await fd.get_standings(lid, season)
+        except fd.FootballDataError as e:
+            st_err = str(e)
+        except Exception as e:
+            st_err = f"{type(e).__name__}: {e}"
+        injuries_by_team, inj_err = {}, None
+        try:
+            injuries_by_team = await fd.get_league_injuries_by_team(lid, season)
+        except fd.FootballDataError as e:
+            inj_err = str(e)
+        except Exception as e:
+            inj_err = f"{type(e).__name__}: {e}"
+        return (lid, season), {
+            "standings": standings,
+            "standings_error": st_err,
+            "injuries_by_team": injuries_by_team,
+            "injuries_error": inj_err,
+        }
+
+    packs: dict = {}
+    if keys:
+        for key, pack in await asyncio.gather(*[one(lid, season) for lid, season in keys]):
+            packs[key] = pack
+    return packs
+
+
 async def assemble_data_pack(fixture_id: int) -> dict:
     """
     Aduna TOATE datele pentru un meci (fixture store + API-Football prin
     adapter). Esecurile partiale devin intrari in data_gaps — analiza continua
     onest cu ce exista. Fara niciun apel LLM.
+
+    Daca exista un pachet de liga preincarcat (analyze_matches), clasamentele
+    si accidentarile vin de acolo — acelasi continut, fara request-uri duplicate.
     """
     fx = await db.get_fixture(fixture_id)
     if not fx:
@@ -377,19 +426,45 @@ async def assemble_data_pack(fixture_id: int) -> dict:
             gaps.append(f"{name}: {type(e).__name__}: {e}")
             return None
 
-    (home_last, away_last, home_stats, away_stats, home_inj, away_inj,
-     h2h, standings, odds, predictions) = await asyncio.gather(
+    shared = (_league_packs.get() or {}).get((league_id, season)) if league_id and season else None
+
+    standings = None
+    home_inj = away_inj = None
+    if shared is not None:
+        if shared.get("standings_error"):
+            gaps.append(f"standings: {shared['standings_error']}")
+        else:
+            standings = shared.get("standings")
+        if shared.get("injuries_error"):
+            gaps.append(f"home_injuries: {shared['injuries_error']}")
+            gaps.append(f"away_injuries: {shared['injuries_error']}")
+        else:
+            by_team = shared.get("injuries_by_team") or {}
+            home_inj = by_team.get(home_id) or fd._injuries_pack_from_raw([], home_id)
+            away_inj = by_team.get(away_id) or fd._injuries_pack_from_raw([], away_id)
+
+    common = [
         safe("home_last_matches", fd.get_team_last_matches(home_id, 6)),
         safe("away_last_matches", fd.get_team_last_matches(away_id, 6)),
         safe("home_season_stats", fd.get_team_statistics(home_id, league_id, season)),
         safe("away_season_stats", fd.get_team_statistics(away_id, league_id, season)),
-        safe("home_injuries", fd.get_injuries(home_id, season)),
-        safe("away_injuries", fd.get_injuries(away_id, season)),
         safe("h2h", fd.get_h2h(home_id, away_id, 6)),
-        safe("standings", fd.get_standings(league_id, season)),
         safe("odds", fd.get_odds(fixture_id)),
         safe("predictions", fd.get_predictions(fixture_id)),
-    )
+    ]
+    if shared is None:
+        (home_last, away_last, home_stats, away_stats, home_inj, away_inj,
+         h2h, standings, odds, predictions) = await asyncio.gather(
+            common[0], common[1], common[2], common[3],
+            safe("home_injuries", fd.get_injuries(home_id, season)),
+            safe("away_injuries", fd.get_injuries(away_id, season)),
+            common[4],
+            safe("standings", fd.get_standings(league_id, season)),
+            common[5], common[6],
+        )
+    else:
+        (home_last, away_last, home_stats, away_stats,
+         h2h, odds, predictions) = await asyncio.gather(*common)
 
     def _row(team_id: int) -> Optional[dict]:
         if not standings:
@@ -610,6 +685,8 @@ async def analyze_matches_events(fixture_ids: list[int], max_matches: int = 15,
         yield ("result", {"error": "Niciun fixture_id de analizat."})
         return
 
+    packs = await prefetch_league_packs(ids)
+    token = _league_packs.set(packs)
     sem = asyncio.Semaphore(max_parallel_analysts())
     timeout = analyst_timeout_seconds()
 
@@ -627,14 +704,17 @@ async def analyze_matches_events(fixture_ids: list[int], max_matches: int = 15,
                     log.exception("Nu am putut persista timeout-ul analistului")
                 return failed
 
-    tasks = [asyncio.create_task(one(fid)) for fid in ids]
-    results: list[dict] = []
-    done = 0
-    for finished in asyncio.as_completed(tasks):
-        results.append(await finished)
-        done += 1
-        just = results[-1].get("match") or ""
-        yield ("progress", done, total, just)
+    try:
+        tasks = [asyncio.create_task(one(fid)) for fid in ids]
+        results: list[dict] = []
+        done = 0
+        for finished in asyncio.as_completed(tasks):
+            results.append(await finished)
+            done += 1
+            just = results[-1].get("match") or ""
+            yield ("progress", done, total, just)
+    finally:
+        _league_packs.reset(token)
 
     ok = [r for r in results if not r.get("analysis_failed")]
     failed = [r for r in results if r.get("analysis_failed")]
