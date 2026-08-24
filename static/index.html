@@ -758,7 +758,6 @@ $("#devBtn").addEventListener("click", () => {
 
 (async function initConfig() {
   try { serverConfig = await (await fetch("/api/config")).json(); } catch (e) {}
-  if (!localStorage.getItem("betmind_advanced")) advancedMode = serverConfig.default_mode === "analysts";
   applyDevUI();
   applyModeUI();
 })();

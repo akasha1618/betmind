@@ -51,3 +51,11 @@ def test_visibilitychange_reconnects_inflight_turn():
     assert "Reconectez…" in INDEX
     assert "/api/turns/" in INDEX
     assert "inflight.reconnect" in INDEX
+
+
+def test_advanced_mode_starts_off_until_user_clicks():
+    """Modul classic e implicit; Avansat doar dupa click (sau localStorage=yes)."""
+    assert 'localStorage.getItem("betmind_advanced") === "yes"' in INDEX
+    assert "default_mode === \"analysts\"" not in INDEX
+    assert 'id="advBtn"' in INDEX
+    assert "aria-pressed" in INDEX
