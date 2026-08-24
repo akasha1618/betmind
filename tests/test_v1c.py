@@ -3,7 +3,7 @@ Teste de acceptanta V1-C (Quality & Conversation Pack) + aditiile 8-10:
 (a) build_ticket cu excluded_fixture_ids: fixture-ul exclus nu apare niciodata
 (b) biletul + selectiile persistate la generare (e2e mock-uit)
 (c) prompturile contin lista de fraze interzise si regula orei Romaniei
-(d) schema analistului respinge top_factors fara cifra/entitate numita
+(d) schema analistului elimina top_factors generici, nu invalideaza analiza
 (8) prompt caching: prefix stabil marcat, tokenii de cache logati in usage_log
 (9) analistul e instruit sa scrie in romana
 (10) comutatorul classic: regulile si persistenta functioneaza si acolo
@@ -15,7 +15,6 @@ import json
 from types import SimpleNamespace
 
 import pytest
-from pydantic import ValidationError
 
 import agent
 import analysts
@@ -23,7 +22,10 @@ import db
 import football_data as fd
 import prompts
 from ticket_builder import build_ticket
-from tests.test_v1b import _msg, _text, _tool, _FakeStream, _seed_fixture, _today, _now_iso
+from tests.test_v1b import (
+    _msg, _text, _tool, _FakeStream, _seed_fixture, _today, _now_iso,
+    _valid_analysis_json, _fake_usage,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -208,16 +210,110 @@ def _analysis_payload(factors: list[str]) -> dict:
     }
 
 
-def test_analyst_schema_rejects_generic_top_factor():
-    with pytest.raises(ValidationError, match="generic"):
-        analysts.MatchAnalysis.model_validate(
-            _analysis_payload(["echipa gazdă e mai bună și în formă"])
-        )
-    # Cu cifra -> trece; cu jucator numit -> trece.
+def test_analyst_schema_drops_generic_top_factor_keeps_rest():
+    """Un factor generic e eliminat; restul analizei ramane valida.
+    Nu se mai ridica ValidationError pe toata analiza."""
+    only_generic = analysts.MatchAnalysis.model_validate(
+        _analysis_payload(["echipa gazdă e mai bună și în formă"])
+    )
+    assert only_generic.top_factors == []
+
+    mixed = analysts.MatchAnalysis.model_validate(
+        _analysis_payload([
+            "echipa gazdă e mai bună și în formă",
+            "Gazdele au 4W din 5 acasă",
+            "revine golgheterul Burcă",
+        ])
+    )
+    assert mixed.top_factors == ["Gazdele au 4W din 5 acasă", "revine golgheterul Burcă"]
+
+
+def test_analyst_schema_keeps_midweek_european_and_date_factors():
+    """Observatiile de program (meci european / zile de pauza) si datele
+    sunt acceptate — nu doar cifra sau nume propriu."""
     ok = analysts.MatchAnalysis.model_validate(
-        _analysis_payload(["Gazdele au 4W din 5 acasă", "revine golgheterul Burcă"])
+        _analysis_payload([
+            "Ambele echipe nu au meciuri europene de mijlocul săptămânii; se profilează duelul pe stabilitate și calitate ofensivă",
+            "Kickoff luni 19:30",
+        ])
     )
     assert len(ok.top_factors) == 2
+
+
+def test_extract_json_strips_markdown_and_uses_outer_braces():
+    blob = 'nota\n```json\n{"a": 1, "nested": {"b": 2}}\n```\n'
+    assert analysts._extract_json(blob) == {"a": 1, "nested": {"b": 2}}
+
+
+def test_extract_json_repairs_truncated_object():
+    obj = analysts._extract_json('{"match": "A vs B", "fixture_id": 1')
+    assert obj["match"] == "A vs B"
+    assert obj["fixture_id"] == 1
+
+
+def test_analyst_max_tokens_default_is_4000(monkeypatch):
+    monkeypatch.delenv("ANALYST_MAX_TOKENS", raising=False)
+    assert analysts.analyst_max_tokens() == 4000
+
+
+def test_coordinator_must_not_improvise_after_failed_analyses(monkeypatch):
+    monkeypatch.setenv("ORCHESTRATION_MODE", "analysts")
+    p = prompts.build_system_prompt()
+    assert "NEVER compensate for failed analyses" in p
+    assert "how many matches could not be analyzed" in p
+    assert "preseason-friendly" in p
+
+
+def test_data_gaps_stringified_json_array_is_accepted():
+    """Analistul a dublu-serializat lista; nu retry, parseaza-o."""
+    payload = _analysis_payload(["Gazdele au 4W din 5 acasă"])
+    payload["data_gaps"] = (
+        '[\n  "Sezonul 2026 abia a început; Osasuna nu are statistici oficiale.",\n'
+        '  "Lipsesc informații despre formația de start."\n]'
+    )
+    ok = analysts.MatchAnalysis.model_validate(payload)
+    assert len(ok.data_gaps) == 2
+    assert "Sezonul 2026" in ok.data_gaps[0]
+
+
+def test_market_probs_consistency_warns_but_does_not_reject():
+    bad = analysts.market_probs_consistency_warnings({
+        "home": 0.9, "draw": 0.2, "away": 0.2,
+        "over25": 0.8, "under25": 0.1,
+        "btts_yes": 0.7, "btts_no": 0.1,
+        "dc_home_draw": 0.5,
+    })
+    assert any("1X2" in w for w in bad)
+    assert any("O/U 2.5" in w for w in bad)
+    assert any("BTTS" in w for w in bad)
+    assert any("DC 1X" in w for w in bad)
+
+    good = analysts.market_probs_consistency_warnings({
+        "home": 0.45, "draw": 0.28, "away": 0.27,
+        "over25": 0.52, "under25": 0.48,
+        "btts_yes": 0.50, "btts_no": 0.50,
+        "dc_home_draw": 0.73,
+    })
+    assert good == []
+
+
+async def test_inconsistent_probs_downgrade_confidence_not_fail(no_http, monkeypatch):
+    await db.init_db()
+    await _seed_fixture(1, _today())
+    await db.budget_add(_today(), 50)
+
+    blob = json.loads(_valid_analysis_json(1))
+    blob["confidence"] = "high"
+    blob["market_probs"] = {"home": 0.9, "draw": 0.2, "away": 0.2,
+                            "over25": 0.55, "under25": 0.45, "btts_yes": 0.5}
+
+    async def fake_llm(system, user):
+        return json.dumps(blob), _fake_usage()
+
+    monkeypatch.setattr(analysts, "_call_analyst_llm", fake_llm)
+    res = await analysts.analyze_match(1)
+    assert res.get("analysis_failed") is not True
+    assert res["confidence"] == "low"
 
 
 # ---------------------------------------------------------------------------

@@ -47,6 +47,11 @@ def isolated_env(tmp_path, monkeypatch):
     fd._last_rate_headers.clear()
     fd._inflight.clear()
     fd.set_current_turn(None)
+    # In teste: fără așteptare 240/min și fără backoff de 1s pe retry.
+    monkeypatch.setenv("API_MAX_CONCURRENT", "32")
+    monkeypatch.setenv("API_RATE_LIMIT_PER_MINUTE", "10000")
+    monkeypatch.setenv("API_RETRY_BACKOFF_BASE", "0")
+    fd.reset_http_gate()
     import analysts
     analysts._league_packs.set(None)
     yield

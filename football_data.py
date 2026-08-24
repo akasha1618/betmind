@@ -284,25 +284,116 @@ def last_rate_headers() -> dict:
     return dict(_last_rate_headers)
 
 
-def rate_limit_per_minute() -> Optional[int]:
-    """Limita pe minut CONFIGURATA (env). None = nimic configurat."""
-    raw = os.environ.get("API_FOOTBALL_RATE_LIMIT_PER_MINUTE", "").strip()
-    if not raw:
-        return None
+def api_max_concurrent() -> int:
     try:
-        return int(raw)
+        return max(1, int(os.environ.get("API_MAX_CONCURRENT", "8")))
     except ValueError:
-        return None
+        return 8
+
+
+def api_http_attempts() -> int:
+    try:
+        return max(1, int(os.environ.get("API_HTTP_ATTEMPTS", "3")))
+    except ValueError:
+        return 3
+
+
+def api_retry_backoff_base() -> float:
+    try:
+        return max(0.0, float(os.environ.get("API_RETRY_BACKOFF_BASE", "1")))
+    except ValueError:
+        return 1.0
+
+
+def rate_limit_per_minute() -> Optional[int]:
+    """Limita pe minut aplicata (env). Implicit 240, sub plafonul real ~300."""
+    raw = (os.environ.get("API_RATE_LIMIT_PER_MINUTE")
+           or os.environ.get("API_FOOTBALL_RATE_LIMIT_PER_MINUTE")
+           or "240").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        return 240
+    return n if n > 0 else 240
 
 
 def rate_limiter_active() -> bool:
-    """Exista un limitator de ritm care chiar intarzie apelurile?
+    """Limitatorul de ritm e aplicat pe toate apelurile HTTP (inclusiv sync)."""
+    return True
 
-    Deocamdata NU: singurul control de debit din aplicatie este
-    Semaphore(MAX_PARALLEL_ANALYSTS), care limiteaza cati analisti ruleaza
-    simultan, nu cate cereri HTTP pleaca intr-un minut.
-    """
-    return False
+
+def _is_odds_endpoint(endpoint: str) -> bool:
+    return (endpoint or "").rstrip("/").endswith("/odds")
+
+
+class HttpGate:
+    """Semaphore de concurenta + token bucket pe minut, cu prioritate /odds."""
+
+    def __init__(self) -> None:
+        self.concurrent = api_max_concurrent()
+        self.rate = max(1, rate_limit_per_minute() or 240)
+        self._sem = asyncio.Semaphore(self.concurrent)
+        self._lock = asyncio.Lock()
+        burst = float(min(self.concurrent, self.rate))
+        self._tokens = burst
+        self._burst = burst
+        self._last = time.monotonic()
+        self._rate_per_sec = self.rate / 60.0
+        self._odds_waiters = 0
+
+    def _refill(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._last
+        self._last = now
+        self._tokens = min(self._burst, self._tokens + elapsed * self._rate_per_sec)
+
+    async def acquire(self, endpoint: str) -> None:
+        is_odds = _is_odds_endpoint(endpoint)
+        if is_odds:
+            async with self._lock:
+                self._odds_waiters += 1
+        try:
+            while True:
+                async with self._lock:
+                    self._refill()
+                    blocked = (not is_odds) and self._odds_waiters > 0
+                    if not blocked and self._tokens >= 1.0:
+                        self._tokens -= 1.0
+                        break
+                    if self._tokens < 1.0 and self._rate_per_sec > 0:
+                        wait = (1.0 - self._tokens) / self._rate_per_sec
+                    else:
+                        wait = 0.02
+                await asyncio.sleep(max(0.005, min(wait, 0.25)))
+            await self._sem.acquire()
+        except BaseException:
+            if is_odds:
+                async with self._lock:
+                    self._odds_waiters -= 1
+            raise
+        else:
+            if is_odds:
+                async with self._lock:
+                    self._odds_waiters -= 1
+
+    def release(self) -> None:
+        self._sem.release()
+
+
+_http_gate: Optional[HttpGate] = None
+
+
+def reset_http_gate() -> None:
+    """Reciteste env (teste)."""
+    global _http_gate
+    _http_gate = None
+
+
+def _gate() -> HttpGate:
+    global _http_gate
+    if _http_gate is None:
+        _http_gate = HttpGate()
+    return _http_gate
 
 
 # ---------------------------------------------------------------------------
@@ -415,11 +506,22 @@ async def _get(endpoint: str, params: dict, ttl_key: str) -> Any:
                 del _inflight[cache_id]
 
 
+def _retry_delay(attempt: int, retry_after: Optional[str]) -> float:
+    delay = api_retry_backoff_base() * (2 ** attempt)
+    if delay <= 0:
+        return 0.0  # teste: retry instant, ignora Retry-After
+    if retry_after:
+        try:
+            delay = max(delay, min(float(retry_after), 30.0))
+        except (TypeError, ValueError):
+            pass
+    return delay
+
+
 async def _get_http(endpoint: str, params: dict, ttl_key: str, cache_id: str) -> Any:
-    """Cererea HTTP reala (un singur zbor per cache_id)."""
+    """Cererea HTTP reala (un singur zbor per cache_id), cu ritm + retry pe 429."""
     global _requests_remaining
 
-    # Budget guard: doar request-urile HTTP reale consuma buget.
     limit = max_daily_requests()
     budget_day = today_local().isoformat()
     used = await db.budget_get(budget_day)
@@ -432,67 +534,127 @@ async def _get_http(endpoint: str, params: dict, ttl_key: str, cache_id: str) ->
         )
 
     headers = {"x-apisports-key": _api_key()}
-    started = time.monotonic()
-    try:
-        resp = await _http_get(endpoint, params, headers)
-    except httpx.HTTPError as e:
-        kind = "timeout" if isinstance(e, httpx.TimeoutException) else "network_error"
-        _record_api_error(endpoint, kind, None, f"{type(e).__name__}: {e}", None, params,
-                          time.monotonic() - started)
-        raise FootballDataError(f"[{kind}] Nu am putut contacta API-Football: {e}") from e
+    attempts = api_http_attempts()
+    last_error: Optional[FootballDataError] = None
 
-    elapsed = time.monotonic() - started
-    _note_call(endpoint, elapsed)
-    seen = _rate_headers(resp.headers)
-    if seen:
-        _last_rate_headers.clear()
-        _last_rate_headers.update(seen)
-        _last_rate_headers["at"] = now_local().isoformat(timespec="seconds")
-    used = await db.budget_add(budget_day, 1)
+    for attempt in range(attempts):
+        used = await db.budget_get(budget_day)
+        if used >= limit:
+            _record_api_error(endpoint, "budget_exhausted", None,
+                              f"buget zilnic local: {used}/{limit} folosite azi", None, params)
+            raise BudgetExhausted(
+                f"Bugetul zilnic de {limit} request-uri API-Football a fost epuizat "
+                f"({used} folosite azi). Raspund din baza locala."
+            )
 
+        await _gate().acquire(endpoint)
+        started = time.monotonic()
+        try:
+            try:
+                resp = await _http_get(endpoint, params, headers)
+            except httpx.HTTPError as e:
+                kind = "timeout" if isinstance(e, httpx.TimeoutException) else "network_error"
+                _record_api_error(endpoint, kind, None, f"{type(e).__name__}: {e}", None, params,
+                                  time.monotonic() - started)
+                raise FootballDataError(
+                    f"[{kind}] Nu am putut contacta API-Football: {e}") from e
+
+            elapsed = time.monotonic() - started
+            _note_call(endpoint, elapsed)
+            seen = _rate_headers(resp.headers)
+            if seen:
+                _last_rate_headers.clear()
+                _last_rate_headers.update(seen)
+                _last_rate_headers["at"] = now_local().isoformat(timespec="seconds")
+            await db.budget_add(budget_day, 1)
+
+            outcome, payload_or_err, retryable = _interpret_response(
+                resp, endpoint, params, elapsed)
+            if outcome == "ok":
+                _requests_remaining = resp.headers.get(
+                    "x-ratelimit-requests-remaining", _requests_remaining)
+                limit_header = resp.headers.get("x-ratelimit-requests-limit")
+                if _requests_remaining is not None and limit_header:
+                    try:
+                        used_now = await db.budget_get(budget_day)
+                        used_by_api = int(limit_header) - int(_requests_remaining)
+                        if used_by_api > used_now:
+                            await db.budget_floor(budget_day, used_by_api)
+                    except ValueError:
+                        pass
+                async with _cache_lock:
+                    _cache[cache_id] = (time.time() + TTL[ttl_key], payload_or_err)
+                return payload_or_err
+
+            last_error = payload_or_err  # FootballDataError
+            if retryable and attempt < attempts - 1:
+                delay = _retry_delay(attempt, (resp.headers or {}).get("retry-after"))
+                log.warning(
+                    "API-Football rate limit, retry %s/%s in %.1fs endpoint=%s",
+                    attempt + 1, attempts, delay, endpoint,
+                )
+            else:
+                rec = getattr(last_error, "_retry_record", None)
+                if rec is not None:
+                    _record_api_error(*rec)
+                raise last_error
+        finally:
+            _gate().release()
+
+        if retryable and attempt < attempts - 1:
+            await asyncio.sleep(delay)
+
+    raise last_error or FootballDataError("API-Football: esuat dupa retry-uri")
+
+
+def _interpret_response(resp: httpx.Response, endpoint: str, params: dict,
+                        elapsed: float) -> tuple[str, Any, bool]:
+    """('ok', payload, False) | ('err', FootballDataError, retryable)."""
     if resp.status_code != 200:
         kind = {429: "http_429_rate_limit", 403: "http_403_forbidden",
                 499: "http_499"}.get(resp.status_code, f"http_{resp.status_code}")
-        _record_api_error(endpoint, kind, resp.status_code, resp.text,
-                          resp.headers, params, elapsed)
-        raise FootballDataError(
-            f"[{kind}] API-Football a raspuns cu status {resp.status_code}: {resp.text[:200]}")
-
-    # Cross-check cu headerele de rate limit raportate de API.
-    _requests_remaining = resp.headers.get("x-ratelimit-requests-remaining", _requests_remaining)
-    limit_header = resp.headers.get("x-ratelimit-requests-limit")
-    if _requests_remaining is not None and limit_header:
-        try:
-            used_by_api = int(limit_header) - int(_requests_remaining)
-            if used_by_api > used:
-                await db.budget_floor(budget_day, used_by_api)
-        except ValueError:
+        retryable = resp.status_code == 429
+        if not retryable:
+            _record_api_error(endpoint, kind, resp.status_code, resp.text,
+                              resp.headers, params, elapsed)
+        else:
+            # Inregistram doar daca e ultima incercare — apelantul decide.
             pass
+        err = FootballDataError(
+            f"[{kind}] API-Football a raspuns cu status {resp.status_code}: {resp.text[:200]}")
+        if retryable:
+            # Pasam kind pe exceptie prin mesaj; inregistram la abandon.
+            err._retry_kind = kind  # type: ignore[attr-defined]
+            err._retry_record = (endpoint, kind, resp.status_code, resp.text,
+                                 resp.headers, params, elapsed)  # type: ignore[attr-defined]
+        return ("err", err, retryable)
 
     try:
         data = resp.json()
     except Exception as e:
-        # Corp care nu e JSON (pagina de eroare a proxy-ului, HTML de la CDN...).
         _record_api_error(endpoint, "invalid_json", resp.status_code, resp.text,
                           resp.headers, params, elapsed)
-        raise  # tipul exceptiei ramane neschimbat — doar am facut-o vizibila
+        raise
 
     errors = data.get("errors")
-    if errors:  # poate fi dict sau lista; gol inseamna OK
-        # Cazul perfid: HTTP 200, dar in corp scrie ca ai depasit limita PE MINUT.
-        # Nu etichetam totul «rate limit»: doar daca textul chiar spune asta.
+    if errors:
         text = _errors_text(errors)
         extra = data.get("message")
         if extra:
             text = f"{text} | message={extra}"
-        kind = "rate_limit_in_body" if _looks_like_rate_limit(text) else "api_errors_in_body"
-        _record_api_error(endpoint, kind, resp.status_code, text, resp.headers, params, elapsed)
-        raise FootballDataError(f"[{kind}] API-Football a returnat erori: {errors}")
+        retryable = _looks_like_rate_limit(text)
+        kind = "rate_limit_in_body" if retryable else "api_errors_in_body"
+        err = FootballDataError(f"[{kind}] API-Football a returnat erori: {errors}")
+        if retryable:
+            err._retry_kind = kind  # type: ignore[attr-defined]
+            err._retry_record = (endpoint, kind, resp.status_code, text,
+                                 resp.headers, params, elapsed)  # type: ignore[attr-defined]
+        else:
+            _record_api_error(endpoint, kind, resp.status_code, text,
+                              resp.headers, params, elapsed)
+        return ("err", err, retryable)
 
-    payload = data.get("response", [])
-    async with _cache_lock:
-        _cache[cache_id] = (time.time() + TTL[ttl_key], payload)
-    return payload
+    return ("ok", data.get("response", []), False)
 
 
 def requests_remaining() -> Optional[str]:

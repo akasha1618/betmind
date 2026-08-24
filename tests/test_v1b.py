@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from types import SimpleNamespace
 
 import agent
@@ -102,23 +103,34 @@ async def test_analyze_matches_parallel_within_semaphore(no_http, monkeypatch):
 # (b) JSON invalid -> retry -> analysis_failed
 # ---------------------------------------------------------------------------
 
-async def test_invalid_json_retries_once_then_analysis_failed(no_http, monkeypatch):
+async def test_invalid_json_retries_once_then_analysis_failed(
+        no_http, monkeypatch, caplog):
     await db.init_db()
     day = _today()
     await _seed_fixture(1, day)
     await db.budget_add(day, 50)
 
-    calls = []
+    users = []
+    raw = "imi pare rau, nu pot { asta nu e JSON valid"
 
     async def bad_llm(system, user):
-        calls.append(1)
-        return "imi pare rau, nu pot { asta nu e JSON valid", _fake_usage()
+        users.append(user)
+        return raw, _fake_usage(), "max_tokens"
 
     monkeypatch.setattr(analysts, "_call_analyst_llm", bad_llm)
 
-    res = await analysts.analyze_match(1)
-    assert len(calls) == 2  # apel initial + exact UN retry
+    with caplog.at_level(logging.WARNING, logger="betmind.analysts"):
+        res = await analysts.analyze_match(1)
+    assert len(users) == 2  # apel initial + exact UN retry
     assert res["analysis_failed"] is True
+    assert "max_tokens" in res["error"]
+    # Retry-ul cere corectarea JSON-ului, nu reanaliza pachetului.
+    assert "Do NOT re-analyse" in users[1]
+    assert "parse_error=" in users[1]
+    assert "stop_reason=max_tokens" in users[1]
+    assert raw in users[1]
+    assert "raspuns brut complet" in caplog.text
+    assert raw in caplog.text
 
     stored = await db.latest_analysis(1)
     assert stored is not None
@@ -128,6 +140,31 @@ async def test_invalid_json_retries_once_then_analysis_failed(no_http, monkeypat
     batch = await analysts.analyze_matches([1])
     assert batch["failed"] == 1
     assert batch["failed_fixtures"][0]["fixture_id"] == 1
+    assert "n-au putut fi analizate" in batch["note"]
+    assert "NU chema get_odds" in batch["note"]
+
+
+async def test_invalid_json_retry_fixes_without_reanalysis(no_http, monkeypatch):
+    """Al doilea apel primeste eroarea de parsare si poate livra JSON valid."""
+    await db.init_db()
+    day = _today()
+    await _seed_fixture(1, day)
+    await db.budget_add(day, 50)
+
+    users = []
+
+    async def flaky(system, user):
+        users.append(user)
+        if len(users) == 1:
+            return '{"match": "Bologna vs Lazio", "angle": "text lung', _fake_usage()
+        return _valid_analysis_json(1), _fake_usage()
+
+    monkeypatch.setattr(analysts, "_call_analyst_llm", flaky)
+    res = await analysts.analyze_match(1)
+    assert res.get("analysis_failed") is not True
+    assert res["match"] == "NEC vs Excelsior"
+    assert "Do NOT re-analyse" in users[1]
+    assert "parse_error=" in users[1]
 
 
 # ---------------------------------------------------------------------------

@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from contextvars import ContextVar
 from datetime import date, datetime, timedelta
 from typing import Any, AsyncGenerator, Literal, Optional
@@ -76,10 +77,13 @@ def max_parallel_analysts() -> int:
 
 
 def analyst_max_tokens() -> int:
+    # Schema V1-E (market_probs + candidates + top_factors/angle in romana)
+    # depaseste ~1500 tokeni; la 1500 raspunsul e trunchiat (stop_reason=max_tokens)
+    # si json.loads pica cu "Expecting ',' delimiter" in jurul char 2400-3200.
     try:
-        return int(os.environ.get("ANALYST_MAX_TOKENS", "1500"))
+        return int(os.environ.get("ANALYST_MAX_TOKENS", "4000"))
     except ValueError:
-        return 1500
+        return 4000
 
 
 def analyst_timeout_seconds() -> float:
@@ -99,6 +103,78 @@ def analysis_reuse_minutes() -> int:
 # ---------------------------------------------------------------------------
 # Schema stricta a analizei (pydantic)
 # ---------------------------------------------------------------------------
+
+def _parse_json_list(value: Any) -> Any:
+    """Claude pune uneori o lista ca string JSON ('[\"a\", \"b\"]').
+    Parseaza-o; un string obisnuit devine lista cu un singur element."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if not isinstance(value, str):
+        return value
+    s = value.strip()
+    if not s:
+        return []
+    if s[0] in "[{":
+        try:
+            parsed = json.loads(s)
+        except json.JSONDecodeError:
+            return [value]
+        if isinstance(parsed, list):
+            return parsed
+        return [parsed] if parsed is not None else []
+    return [value]
+
+
+def market_probs_consistency_warnings(probs: dict) -> list[str]:
+    """Avertismente (nu erori) cand piețele corelate nu suma ~1 sau DC ≠ 1X2."""
+    warnings: list[str] = []
+    if not isinstance(probs, dict):
+        return warnings
+
+    def _check_sum(keys: tuple[str, ...], label: str, expected: float = 1.0) -> None:
+        present = [(k, float(probs[k])) for k in keys if k in probs]
+        if len(present) < len(keys):
+            return
+        total = sum(v for _, v in present)
+        if abs(total - expected) > 0.05:
+            warnings.append(
+                f"{label}: {'+'.join(k for k, _ in present)}={total:.3f} "
+                f"(așteptat {expected:.2f}, abatere {abs(total - expected):.3f})"
+            )
+
+    def _check_eq(left_keys: tuple[str, ...], right_key: str, label: str) -> None:
+        if right_key not in probs or any(k not in probs for k in left_keys):
+            return
+        left = sum(float(probs[k]) for k in left_keys)
+        right = float(probs[right_key])
+        if abs(left - right) > 0.05:
+            warnings.append(
+                f"{label}: {'+'.join(left_keys)}={left:.3f} vs {right_key}={right:.3f}"
+            )
+
+    _check_sum(("home", "draw", "away"), "1X2")
+    for over_k, under_k, tag in (
+        ("over15", "under15", "O/U 1.5"),
+        ("over25", "under25", "O/U 2.5"),
+        ("over35", "under35", "O/U 3.5"),
+        ("over05_ht", "under05_ht", "O/U 0.5 HT"),
+        ("over15_ht", "under15_ht", "O/U 1.5 HT"),
+    ):
+        _check_sum((over_k, under_k), tag)
+    _check_sum(("btts_yes", "btts_no"), "BTTS")
+    _check_sum(("btts_ht_yes", "btts_ht_no"), "BTTS HT")
+    _check_eq(("home", "draw"), "dc_home_draw", "1X vs DC 1X")
+    _check_eq(("draw", "away"), "dc_draw_away", "X2 vs DC X2")
+    _check_eq(("home", "away"), "dc_home_away", "12 vs DC 12")
+    return warnings
+
+
+# ---------------------------------------------------------------------------
+# Schema pydantic
+# ---------------------------------------------------------------------------
+
 
 class CandidateSelection(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -141,25 +217,67 @@ class MatchAnalysis(BaseModel):
             out[str(key)] = fp
         return out
 
+    @field_validator("data_gaps", "best_candidates", mode="before")
+    @classmethod
+    def _coerce_list_fields(cls, v):
+        return _parse_json_list(v)
+
     @field_validator("top_factors", mode="before")
     @classmethod
     def _max_five_factors(cls, v):
-        return list(v)[:5] if isinstance(v, (list, tuple)) else v
+        parsed = _parse_json_list(v)
+        return list(parsed)[:5] if isinstance(parsed, list) else parsed
 
     @field_validator("top_factors")
     @classmethod
     def _factors_must_be_specific(cls, v: list[str]) -> list[str]:
-        """Fiecare factor trebuie sa contina o cifra/scor/data SAU o entitate
-        numita (nume propriu, aproximat printr-un cuvant capitalizat care nu
-        deschide propozitia). Generalitatile sunt respinse -> retry."""
+        """Pastreaza factorii cu cifra, nume propriu, data, sau un fapt de
+        program din pachet (meci european de mijlocul saptamanii, zile de
+        pauza). Un factor generic e ELIMINAT — nu invalideaza toata analiza."""
+        kept: list[str] = []
         for factor in v:
-            has_digit = any(ch.isdigit() for ch in factor)
-            has_named_entity = any(w[:1].isupper() for w in factor.split()[1:])
-            if not (has_digit or has_named_entity):
-                raise ValueError(
-                    f"top_factor generic, fara cifra/scor/data/jucator numit: {factor!r}"
-                )
-        return v
+            if not isinstance(factor, str) or not factor.strip():
+                continue
+            if _factor_is_specific(factor):
+                kept.append(factor)
+            else:
+                log.warning("Analist: top_factor generic eliminat: %r", factor)
+        return kept
+
+
+_DATE_WORD = re.compile(
+    r"\b(?:0?[1-9]|[12]\d|3[01])[./-](?:0?[1-9]|1[0-2])"
+    r"|\b(?:20\d{2})\b"
+    r"|\b(?:ian(?:uarie)?|feb(?:ruarie)?|mar(?:tie)?|apr(?:ilie)?|"
+    r"iun(?:ie)?|iul(?:ie)?|aug(?:ust)?|sep(?:tembrie)?|oct(?:ombrie)?|"
+    r"nov(?:embrie)?|dec(?:embrie)?|"
+    r"january|february|march|april|june|july|august|september|"
+    r"october|november|december)\b"
+    r"|\bmai\s+\d|\d+\s+mai\b"  # luna, nu adverbul "mai buna"
+    r"|\b(?:luni|marti|marți|miercuri|joi|vineri|sambata|sâmbătă|"
+    r"duminica|duminică|monday|tuesday|wednesday|thursday|friday|"
+    r"saturday|sunday)\b",
+    re.I,
+)
+_PACK_GROUNDED = re.compile(
+    r"europen|midweek|mijlocul\s+s[aă]pt[aă]m[aâ]n|"
+    r"zile\s+de\s+(?:pauz|refacere)|days?\s+(?:of\s+)?rest|"
+    r"nou[- ]promovat",
+    re.I,
+)
+
+
+def _factor_is_specific(factor: str) -> bool:
+    """Cifra, nume propriu (cuvant capitalizat dupa primul), data, sau
+    fapt de program din pachet (meci european / zile de pauza)."""
+    if any(ch.isdigit() for ch in factor):
+        return True
+    words = factor.split()
+    if any(w[:1].isupper() for w in words[1:]):
+        return True
+    if _DATE_WORD.search(factor) or _PACK_GROUNDED.search(factor):
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +476,15 @@ async def _midweek_european_game(team_id: int, kickoff_date: str,
     return bool(rows)
 
 
+def _league_key(league_id, season) -> Optional[tuple[int, int]]:
+    try:
+        if league_id is None or season is None:
+            return None
+        return (int(league_id), int(season))
+    except (TypeError, ValueError):
+        return None
+
+
 async def prefetch_league_packs(fixture_ids: list[int]) -> dict:
     """O singura pereche /standings + /injuries per (liga, sezon) din shortlist."""
     keys: set[tuple[int, int]] = set()
@@ -365,9 +492,9 @@ async def prefetch_league_packs(fixture_ids: list[int]) -> dict:
         fx = await db.get_fixture(fid)
         if not fx:
             continue
-        lid, season = fx.get("league_id"), fx.get("season")
-        if lid and season:
-            keys.add((int(lid), int(season)))
+        key = _league_key(fx.get("league_id"), fx.get("season"))
+        if key:
+            keys.add(key)
 
     async def one(lid: int, season: int) -> tuple[tuple[int, int], dict]:
         standings, st_err = None, None
@@ -395,10 +522,13 @@ async def prefetch_league_packs(fixture_ids: list[int]) -> dict:
     if keys:
         for key, pack in await asyncio.gather(*[one(lid, season) for lid, season in keys]):
             packs[key] = pack
+    log.info("Prefetch ligi: %d (%s) — /standings+/injuries?league= o data per liga, nu per echipa",
+             len(packs),
+             ", ".join(f"{lid}/{season}" for lid, season in sorted(packs)) or "nimic")
     return packs
 
 
-async def assemble_data_pack(fixture_id: int) -> dict:
+async def assemble_data_pack(fixture_id: int, league_packs: Optional[dict] = None) -> dict:
     """
     Aduna TOATE datele pentru un meci (fixture store + API-Football prin
     adapter). Esecurile partiale devin intrari in data_gaps — analiza continua
@@ -426,7 +556,9 @@ async def assemble_data_pack(fixture_id: int) -> dict:
             gaps.append(f"{name}: {type(e).__name__}: {e}")
             return None
 
-    shared = (_league_packs.get() or {}).get((league_id, season)) if league_id and season else None
+    packs = league_packs if league_packs is not None else (_league_packs.get() or {})
+    key = _league_key(league_id, season)
+    shared = packs.get(key) if key else None
 
     standings = None
     home_inj = away_inj = None
@@ -443,28 +575,31 @@ async def assemble_data_pack(fixture_id: int) -> dict:
             home_inj = by_team.get(home_id) or fd._injuries_pack_from_raw([], home_id)
             away_inj = by_team.get(away_id) or fd._injuries_pack_from_raw([], away_id)
 
-    common = [
+    # Cotele intai: fara ele meciul e inutil pentru bilet, iar burst-ul
+    # de statistici le sufocea (rate limit pe /odds).
+    odds = await safe("odds", fd.get_odds(fixture_id))
+
+    rest = [
         safe("home_last_matches", fd.get_team_last_matches(home_id, 6)),
         safe("away_last_matches", fd.get_team_last_matches(away_id, 6)),
         safe("home_season_stats", fd.get_team_statistics(home_id, league_id, season)),
         safe("away_season_stats", fd.get_team_statistics(away_id, league_id, season)),
         safe("h2h", fd.get_h2h(home_id, away_id, 6)),
-        safe("odds", fd.get_odds(fixture_id)),
         safe("predictions", fd.get_predictions(fixture_id)),
     ]
     if shared is None:
         (home_last, away_last, home_stats, away_stats, home_inj, away_inj,
-         h2h, standings, odds, predictions) = await asyncio.gather(
-            common[0], common[1], common[2], common[3],
+         h2h, standings, predictions) = await asyncio.gather(
+            rest[0], rest[1], rest[2], rest[3],
             safe("home_injuries", fd.get_injuries(home_id, season)),
             safe("away_injuries", fd.get_injuries(away_id, season)),
-            common[4],
+            rest[4],
             safe("standings", fd.get_standings(league_id, season)),
-            common[5], common[6],
+            rest[5],
         )
     else:
         (home_last, away_last, home_stats, away_stats,
-         h2h, odds, predictions) = await asyncio.gather(*common)
+         h2h, predictions) = await asyncio.gather(*rest)
 
     def _row(team_id: int) -> Optional[dict]:
         if not standings:
@@ -540,11 +675,11 @@ RULES:
 - MARKET FAMILIES: when the pack has at least 3 distinct families (result, goals, btts, double_chance, handicap, team-based, half-time), propose candidates from at least 3 of them. Safe-but-boring markets (double chance, over 1.5, team to score) are first-class options — not leftovers.
 - Pick the market where your statistical EDGE over the implied probability (prob − 1/avg_odd) is largest AND best justified by the data — not the market with the highest odds.
 - Every candidate's reason MUST name the concrete data points that CREATE the edge: scores, goal averages, named absentees, rest days, H2H dates. "E favorită" is not a reason.
-- top_factors: max 5; EACH must contain at least one concrete number, score, date, or named player from the pack (schema-enforced — entries without one are rejected). No generic claims.
+- top_factors: max 5; EACH should contain a number, score, date, named player, OR a pack-grounded schedule fact (midweek European game, rest days). Vague quality claims are dropped one-by-one — they do not fail the whole analysis.
 - BANNED generic phrases (never use, in any language): "echipă de calitate", "echipă superioară/consacrată", "formă bună" without numbers, "meci deschis", "tradițional cu goluri", "meci de tempo ridicat", "outsider clar" without the odds, "favorită clară" without numbers. If a claim cannot be grounded in pack data, DROP it.
 - angle: ONE non-obvious connection grounded in pack data: schedule congestion (days_since_last_match), midweek European game, stakes/table context, promoted side, key absence chain. One or two sentences, in Romanian.
 - The API-Football predictions block is one signal among many — never copy it as your conclusion.
-- data_gaps: copy the pack's gaps that actually limited you, plus any you noticed. Lower your confidence accordingly.
+- data_gaps: copy the pack's gaps that actually limited you, plus any you noticed. Lower your confidence accordingly. data_gaps and top_factors MUST be JSON arrays of strings, never a stringified array.
 - kickoff is already Romania local time — repeat it as-is, never convert.
 - Be honest: thin data => hedged probabilities and "low" confidence."""
 
@@ -562,25 +697,168 @@ def build_analyst_prompt(odds: Optional[dict] = None) -> str:
     return _ANALYST_SYSTEM_PROMPT + extra
 
 
-async def _call_analyst_llm(system: str, user_content: str) -> tuple[str, Any]:
-    """UN apel Claude (analyst). Separat ca sa fie mock-uibil in teste."""
+_ANALYSIS_TOOL = {
+    "name": "submit_match_analysis",
+    "description": "Return the completed match analysis as structured JSON. Call this once.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "fixture_id": {"type": "integer"},
+            "match": {"type": "string"},
+            "kickoff": {"type": "string"},
+            "market_probs": {
+                "type": "object",
+                "additionalProperties": {"type": "number"},
+            },
+            "best_candidates": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "market": {"type": "string"},
+                        "pick": {"type": "string"},
+                        "odds": {"type": "number"},
+                        "prob": {"type": "number"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["market", "pick", "odds", "prob", "reason"],
+                },
+            },
+            "top_factors": {"type": "array", "items": {"type": "string"}},
+            "angle": {"type": "string"},
+            "data_gaps": {"type": "array", "items": {"type": "string"}},
+            "confidence": {
+                "type": "string",
+                "enum": ["high", "medium", "low"],
+            },
+        },
+        "required": [
+            "fixture_id", "match", "kickoff", "market_probs",
+            "best_candidates", "top_factors", "angle", "confidence",
+        ],
+    },
+}
+
+
+async def _call_analyst_llm(system: str, user_content: str) -> tuple[str, Any, str]:
+    """UN apel Claude (analyst). Intoarce (text, usage, stop_reason).
+
+    Forteaza JSON prin tool_choice (echivalentul structured output la Claude).
+    Mock-urile din teste pot intoarce in continuare (text, usage).
+    """
     client = AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", "").strip())
     msg = await client.messages.create(
         model=analyst_model(),
         max_tokens=analyst_max_tokens(),
+        temperature=0,
         system=system,
         messages=[{"role": "user", "content": user_content}],
+        tools=[_ANALYSIS_TOOL],
+        tool_choice={"type": "tool", "name": "submit_match_analysis"},
     )
-    text = "".join(b.text for b in msg.content if b.type == "text")
-    return text, msg.usage
+    stop_reason = getattr(msg, "stop_reason", None) or ""
+    text = ""
+    for block in msg.content:
+        if getattr(block, "type", None) == "tool_use" and getattr(block, "name", "") == "submit_match_analysis":
+            inp = getattr(block, "input", None)
+            if isinstance(inp, dict):
+                text = json.dumps(inp, ensure_ascii=False)
+                break
+            if isinstance(inp, str) and inp.strip():
+                text = inp
+                break
+    if not text:
+        text = "".join(
+            getattr(b, "text", "") for b in msg.content
+            if getattr(b, "type", None) == "text"
+        )
+    return text, msg.usage, stop_reason
+
+
+def _unpack_llm_result(result: Any) -> tuple[str, Any, str]:
+    """Compatibil cu mock-uri care intorc (text, usage) fara stop_reason."""
+    if not isinstance(result, tuple):
+        raise TypeError(f"_call_analyst_llm a intors {type(result).__name__}, nu tuple")
+    text = result[0] if result else ""
+    usage = result[1] if len(result) > 1 else None
+    stop_reason = result[2] if len(result) > 2 else ""
+    return text or "", usage, stop_reason or ""
 
 
 def _extract_json(text: str) -> dict:
-    """Scoate obiectul JSON din raspuns (tolerant la garduri de cod/prefixe)."""
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end <= start:
+    """Scoate obiectul JSON: elimina garduri markdown, ia de la prima '{'
+    pana la ultima '}'. Daca e trunchiat, incearca sa inchida braces."""
+    if not text or not str(text).strip():
+        raise ValueError("Raspunsul analistului e gol.")
+    cleaned = str(text).strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.I)
+        cleaned = re.sub(r"\s*```\s*$", "", cleaned)
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    if start == -1:
         raise ValueError("Raspunsul analistului nu contine JSON.")
-    return json.loads(text[start:end + 1])
+    if end <= start:
+        repaired = _try_repair_truncated_json(cleaned[start:])
+        if repaired is not None:
+            return repaired
+        raise ValueError("JSON trunchiat (lipsa '}' de inchidere).")
+    blob = cleaned[start:end + 1]
+    try:
+        obj = json.loads(blob)
+    except json.JSONDecodeError:
+        repaired = _try_repair_truncated_json(blob)
+        if repaired is None:
+            raise
+        obj = repaired
+    if not isinstance(obj, dict):
+        raise ValueError("JSON-ul analistului nu e un obiect.")
+    return obj
+
+
+def _try_repair_truncated_json(blob: str) -> Optional[dict]:
+    """Inchide stringuri/obiecte/liste neterminate (trunchiere max_tokens)."""
+    s = blob.rstrip()
+    in_str = False
+    escape = False
+    for ch in s:
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+    if in_str:
+        s += '"'
+    s = re.sub(r",\s*$", "", s)
+    stack: list[str] = []
+    in_str = False
+    escape = False
+    for ch in s:
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            stack.append("}")
+        elif ch == "[":
+            stack.append("]")
+        elif ch in ("}", "]") and stack and stack[-1] == ch:
+            stack.pop()
+    s += "".join(reversed(stack))
+    try:
+        obj = json.loads(s)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
 
 
 async def _log_usage(turn_id: Optional[str], usage: Any) -> None:
@@ -609,7 +887,8 @@ def _analysis_is_fresh(row: dict) -> bool:
         return False
 
 
-async def analyze_match(fixture_id: int, turn_id: Optional[str] = None) -> dict:
+async def analyze_match(fixture_id: int, turn_id: Optional[str] = None,
+                        league_packs: Optional[dict] = None) -> dict:
     """
     Analiza completa a unui meci. Refoloseste o analiza recenta din DB fara
     apel LLM nou. Invalid JSON -> 1 retry -> inregistrare analysis_failed.
@@ -625,24 +904,43 @@ async def analyze_match(fixture_id: int, turn_id: Optional[str] = None) -> dict:
             data["reused"] = True
             return data
 
-    pack = await assemble_data_pack(fixture_id)
+    pack = await assemble_data_pack(fixture_id, league_packs)
     now = fd.now_local().isoformat(timespec="seconds")
     if pack.get("error"):
         failed = {"fixture_id": fixture_id, "analysis_failed": True, "error": pack["error"]}
         await db.add_analysis(fixture_id, now, analyst_model(), json.dumps(failed, ensure_ascii=False))
         return failed
 
-    user_content = json.dumps(pack, ensure_ascii=False, default=str)
+    pack_content = json.dumps(pack, ensure_ascii=False, default=str)
+    system = build_analyst_prompt(pack.get("odds"))
     last_error = ""
+    prev_text = ""
+    prev_stop = ""
     for attempt in (1, 2):  # al doilea = singurul retry permis
+        if attempt == 1:
+            user_content = pack_content
+        else:
+            user_content = (
+                "PREVIOUS OUTPUT WAS INVALID JSON. Do NOT re-analyse the match. "
+                "Fix the JSON only — same conclusions, valid object, no markdown.\n"
+                f"stop_reason={prev_stop or 'unknown'}\n"
+                f"parse_error={last_error}\n"
+                f"previous_output:\n{prev_text}"
+            )
         try:
-            text, usage = await _call_analyst_llm(build_analyst_prompt(pack.get("odds")),
-                                                 user_content)
+            result = await _call_analyst_llm(system, user_content)
+            text, usage, stop_reason = _unpack_llm_result(result)
+            prev_text, prev_stop = text, stop_reason
             await _log_usage(turn_id, usage)
             raw = _extract_json(text)
             validate_market_probs(raw.get("market_probs") or {}, pack.get("odds"))
             analysis = MatchAnalysis.model_validate(raw).model_dump()
             analysis["fixture_id"] = fixture_id  # nu lasam analistul sa-l schimbe
+            warns = market_probs_consistency_warnings(analysis.get("market_probs") or {})
+            if warns:
+                log.warning("Analist fixture=%s market_probs inconsistente: %s",
+                            fixture_id, "; ".join(warns))
+                analysis["confidence"] = "low"
             enrich_candidates(analysis, pack.get("odds"))
             fx = pack.get("fixture") or {}
             for c in analysis.get("best_candidates") or []:
@@ -655,10 +953,20 @@ async def analyze_match(fixture_id: int, turn_id: Optional[str] = None) -> dict:
             return analysis
         except (ValidationError, ValueError, json.JSONDecodeError) as e:
             last_error = f"JSON invalid de la analist (incercarea {attempt}): {e}"
-            log.warning("Analist fixture=%s: %s", fixture_id, last_error)
+            if prev_stop == "max_tokens":
+                last_error += " [stop_reason=max_tokens — raspuns trunchiat]"
+            log.warning(
+                "Analist fixture=%s: %s stop_reason=%s chars=%d",
+                fixture_id, last_error, prev_stop or "unknown", len(prev_text),
+            )
+            log.warning(
+                "Analist fixture=%s raspuns brut complet (stop_reason=%s):\n%s",
+                fixture_id, prev_stop or "unknown", prev_text,
+            )
         except Exception as e:
             last_error = f"Apel analist esuat (incercarea {attempt}): {type(e).__name__}: {e}"
-            log.warning("Analist fixture=%s: %s", fixture_id, last_error)
+            log.warning("Analist fixture=%s: %s stop_reason=%s",
+                        fixture_id, last_error, prev_stop or "unknown")
 
     failed = {"fixture_id": fixture_id, "analysis_failed": True, "error": last_error}
     await db.add_analysis(fixture_id, fd.now_local().isoformat(timespec="seconds"),
@@ -693,7 +1001,8 @@ async def analyze_matches_events(fixture_ids: list[int], max_matches: int = 15,
     async def one(fid: int) -> dict:
         async with sem:
             try:
-                return await asyncio.wait_for(analyze_match(fid, turn_id), timeout)
+                return await asyncio.wait_for(
+                    analyze_match(fid, turn_id, packs), timeout)
             except asyncio.TimeoutError:
                 failed = {"fixture_id": fid, "analysis_failed": True,
                           "error": f"Analiza a depasit {int(timeout)}s si a fost oprita."}
@@ -728,14 +1037,23 @@ async def analyze_matches_events(fixture_ids: list[int], max_matches: int = 15,
         "note": ("Foloseste best_candidates drept candidati pentru build_ticket "
                  "(include edge, avg_odds, best_bookmaker, confidence, league, kickoff). "
                  "Citeaza top_factors si angle in motivarea selectiilor; "
-                 "mentioneaza onest data_gaps si confidence scazut."),
+                 "mentioneaza onest data_gaps si confidence scazut. "
+                 "Construiește biletul DOAR din analyses[].best_candidates "
+                 "(analizele reușite). NU chema get_odds / get_team_last_matches / "
+                 "get_h2h / get_injuries ca sa inlocuiesti o analiza esuata — "
+                 "nu improviza din amicale de presezon."),
     }
     if failed:
         summary["failed_fixtures"] = [
             {"fixture_id": r["fixture_id"], "error": r.get("error", "necunoscut")} for r in failed
         ]
-        summary["note"] += (" Meciurile esuate se sar cu O linie onesta in raspuns "
-                            "(nu inventa analize pentru ele).")
+        n_fail, n_req = len(failed), total
+        summary["note"] += (
+            f" {n_fail} din {n_req} meciuri n-au putut fi analizate — "
+            "spune-i utilizatorului onest cifra, sari peste ele, si NU inventa "
+            "analize / cote / forma pentru ele. Daca ZERO analize au reusit, "
+            "nu construi un bilet; spune ca analizele au esuat si ofera retry."
+        )
     yield ("result", summary)
 
 

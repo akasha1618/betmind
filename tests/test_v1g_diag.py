@@ -203,15 +203,14 @@ async def test_health_exposes_odds_diagnostics(fake_http, monkeypatch):
     assert "requests per minute" in body["last_odds_error"]["body"]
     assert body["last_odds_error"]["at"]
     assert "api_requests_used_today" in body
-    # Limitatorul de ritm: raportam onest ca NU exista unul activ.
-    assert body["rate_limiter_active"] is False
-    assert body["rate_limit_per_minute"] is None
+    assert body["rate_limiter_active"] is True
+    assert body["rate_limit_per_minute"] == 10000  # isolated_env
 
-    monkeypatch.setenv("API_FOOTBALL_RATE_LIMIT_PER_MINUTE", "300")
+    monkeypatch.setenv("API_RATE_LIMIT_PER_MINUTE", "300")
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         body = (await client.get("/api/health")).json()
     assert body["rate_limit_per_minute"] == 300
-    assert body["rate_limiter_active"] is False  # configurat != aplicat
+    assert body["rate_limiter_active"] is True
 
 
 # ------------------------------------------------- statistici per tura (dev UI)
@@ -229,13 +228,13 @@ async def test_turn_stats_count_calls_failures_and_duration(fake_http):
         await fd._get("/odds", {"fixture": 11}, "odds")
 
     stats = fd.turn_api_stats("tura-1")
-    assert stats["api_calls"] == 2          # doar cererile HTTP reale
+    assert stats["api_calls"] == 1 + fd.api_http_attempts()  # fixtures + 3 retry-uri /odds
     assert stats["cache_hits"] == 1
     assert stats["failures"] == 1
     assert stats["by_kind"] == {"rate_limit_in_body": 1}
     assert stats["by_status"] == {"200": 1}
     assert stats["duration_s"] >= 0
-    assert stats["endpoints"]["/odds"] == 1
+    assert stats["endpoints"]["/odds"] == fd.api_http_attempts()
 
     assert fd.turn_api_stats("tura-inexistenta")["api_calls"] == 0
 
@@ -254,7 +253,7 @@ async def test_turn_stats_follow_parallel_tasks(fake_http):
     await asyncio.gather(*(one(i) for i in range(4)))
 
     stats = fd.turn_api_stats("tura-paralela")
-    assert stats["api_calls"] == 4
+    assert stats["api_calls"] == 4 * fd.api_http_attempts()
     assert stats["failures"] == 4
     assert stats["by_kind"]["rate_limit_in_body"] == 4
 
@@ -274,7 +273,7 @@ async def test_usage_endpoint_includes_api_stats(fake_http):
 
     assert body["api"]["failures"] == 1
     assert body["api"]["by_kind"] == {"rate_limit_in_body": 1}
-    assert body["api"]["api_calls"] == 1
+    assert body["api"]["api_calls"] == fd.api_http_attempts()
 
 
 async def test_failure_is_logged_with_body_and_headers(fake_http, caplog):
