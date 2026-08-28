@@ -41,6 +41,7 @@ SQLite trebuie să stea pe un disc care supraviețuiește redeploy-urilor.
 |---|---|
 | `ANTHROPIC_API_KEY` | cheia Claude, de la console.anthropic.com |
 | `API_FOOTBALL_KEY` | cheia API-Football, de la dashboard.api-football.com |
+| `ODDSPAPI_KEY` | cheia OddsPapi (cote + link Superbet.ro). **Fără ea, biletele ies fără butonul → Superbet** |
 | `CLAUDE_MODEL` | modelul orchestratorului (ex. `claude-sonnet-4-5`) |
 | `ANALYST_MODEL` | modelul analiștilor de meci (ex. `claude-3-5-haiku-latest`) |
 | `APP_TIMEZONE` | `Europe/Bucharest` |
@@ -78,7 +79,7 @@ Deschide `https://<domeniul-tau>/api/health` (nu cere parolă) și verifică:
 - `"disk_writable": true` — **volumul e montat corect și se poate scrie pe el**
   (dacă e `false`, verifică mount path-ul `/data` la pasul 3);
 - `"access_gate_enabled": true` — parola de acces e activă;
-- `"anthropic_key_set": true` și `"api_football_key_set": true`.
+- `"anthropic_key_set": true`, `"api_football_key_set": true` și `"oddspapi_key_set": true` (ultima e pentru butonul Superbet).
 
 Apoi testul de acces:
 

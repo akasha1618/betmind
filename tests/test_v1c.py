@@ -229,6 +229,18 @@ async def test_ticket_persistence_works_in_classic_mode_too(monkeypatch):
     assert row["conversation_id"] == "classic-conv"
 
 
+def test_classic_get_odds_batch_are_ids_pentru_superbet():
+    """În mode=classic nu există analyze_matches — id-urile vin din get_odds."""
+    ids = agent._fixture_ids_from_tool("get_odds", {"fixture_id": 1550099}, None)
+    assert ids == [1550099]
+    ids = agent._fixture_ids_from_tool(
+        "build_ticket",
+        {"candidates": [{"fixture_id": 1}, {"fixture_id": 2}]},
+        None,
+    )
+    assert ids == [1, 2]
+
+
 # ---------------------------------------------------------------------------
 # (c)+(9)+(10) reguli in prompturi, in AMBELE moduri
 # ---------------------------------------------------------------------------

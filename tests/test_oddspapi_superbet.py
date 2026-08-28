@@ -509,6 +509,18 @@ async def test_apply_superbet_pune_linkul_chiar_daca_modelul_a_scris_betano():
     assert "Betano" not in sels[0]["odds_label"]
 
 
+async def test_apply_aduce_superbet_si_fara_prefetch_prealabil(oddspapi):
+    """Mod classic: get_odds fără analyze_matches — apply trage Superbet acum."""
+    sels = [{
+        "fixture_id": 1001, "match": "Rapid București vs CS Universitatea Craiova",
+        "market": "1x2", "pick": "Home", "odds": 2.00,
+        "kickoff": "2026-08-22T19:30:00+03:00",
+    }]
+    await op.apply_superbet_to_selections(sels)
+    assert sels[0]["bookmaker_link"].startswith("https://superbet.ro/")
+    assert sels[0]["odds"] == 2.05
+
+
 # ---------------------------------------------------------------------------
 # Identitate persistenta: mapare + snapshot Superbet in DB
 # ---------------------------------------------------------------------------

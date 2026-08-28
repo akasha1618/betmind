@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import uuid
+import asyncio
 from collections import defaultdict
 from typing import Any, AsyncGenerator, Optional
 
@@ -633,7 +634,10 @@ async def _execute_tool(name: str, args: dict[str, Any],
         if name == "get_standings":
             return await fd.get_standings(args["league_id"], args["season"])
         if name == "get_odds":
-            return await fd.get_odds(args["fixture_id"])
+            fid = args["fixture_id"]
+            odds = await fd.get_odds(fid)
+            await _overlay_superbet_on_odds(fid, odds)
+            return odds
         if name == "build_ticket":
             parsed = parse_selection_request(user_text or "")
             target_sel = args.get("target_selections")
@@ -715,6 +719,44 @@ def _serializable_content(message) -> list[dict]:
     return blocks
 
 
+def _kickoff_superbet_prefetch(tool_blocks: list) -> None:
+    """Pornește OddsPapi în fundal și pe fluxul classic (doar get_odds).
+
+    Fără analyze_matches, prefetch-ul din analysts nu rulează — de-asta pe
+    Railway, în mode=classic, biletele ieșeau fără link Superbet."""
+    ids: list[int] = []
+    for b in tool_blocks:
+        ids.extend(_fixture_ids_from_tool(b.name, b.input or {}, None))
+    if not ids:
+        return
+    if not op.enabled():
+        log.warning("OddsPapi: ODDSPAPI_KEY lipsă — biletele ies fără link Superbet")
+        return
+    seen: list[int] = []
+    got: set[int] = set()
+    for fid in ids:
+        if fid not in got:
+            got.add(fid)
+            seen.append(fid)
+    log.info("Superbet RO: prefetch în fundal pentru %d meciuri", len(seen))
+    asyncio.create_task(op.prefetch_for_fixtures(seen))
+
+
+async def _overlay_superbet_on_odds(fid: Any, odds: Any) -> None:
+    """Dacă Superbet e deja în cache, pune cotele pe pachetul get_odds."""
+    if not op.enabled() or not isinstance(odds, dict) or odds.get("error"):
+        return
+    try:
+        nfid = int(fid)
+    except (TypeError, ValueError):
+        return
+    sb = op._sb_cached(nfid)
+    if not sb:
+        sb = await op._pack_from_db(nfid)
+    if sb:
+        op.overlay_on_odds_pack(odds, sb)
+
+
 def _fixture_ids_from_tool(name: str, args: dict, result: Any) -> list[int]:
     """Fixture-urile văzute în tură — pentru link Superbet și fără build_ticket."""
     ids: list[int] = []
@@ -728,10 +770,14 @@ def _fixture_ids_from_tool(name: str, args: dict, result: Any) -> list[int]:
                   "get_h2h", "get_injuries"):
         if args.get("fixture_id"):
             ids.append(args["fixture_id"])
-    elif name == "build_ticket" and isinstance(result, dict):
-        for s in result.get("selections") or []:
+    elif name == "build_ticket":
+        for s in (args or {}).get("candidates") or []:
             if isinstance(s, dict) and s.get("fixture_id"):
                 ids.append(s["fixture_id"])
+        if isinstance(result, dict):
+            for s in result.get("selections") or []:
+                if isinstance(s, dict) and s.get("fixture_id"):
+                    ids.append(s["fixture_id"])
     out: list[int] = []
     seen: set[int] = set()
     for raw in ids:
@@ -938,6 +984,7 @@ async def run_turn(messages: list[dict],
             for b in tool_blocks:
                 batch_of[b.name].append(b)
             announced: set[str] = set()
+            _kickoff_superbet_prefetch(tool_blocks)
 
             for block in tool_blocks:
                 log.info("Tool call: %s args=%s", block.name, json.dumps(block.input or {}, ensure_ascii=False)[:500])

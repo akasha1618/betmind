@@ -237,6 +237,7 @@ async def health():
         "anthropic_key_set": bool(os.environ.get("ANTHROPIC_API_KEY", "").strip()),
         "anthropic_base_url": os.environ.get("ANTHROPIC_BASE_URL", "").strip() or "https://api.anthropic.com",
         "api_football_key_set": bool(os.environ.get("API_FOOTBALL_KEY", "").strip()),
+        "oddspapi_key_set": bool(os.environ.get("ODDSPAPI_KEY", "").strip()),
         "api_football_requests_remaining_today": fd.requests_remaining(),
         "active_sessions": len(SESSIONS),
         # V1-A: metadata fixture store & sync
@@ -658,6 +659,7 @@ def _startup_report():
     for key, hint in [
         ("ANTHROPIC_API_KEY", "https://console.anthropic.com/settings/keys"),
         ("API_FOOTBALL_KEY", "https://dashboard.api-football.com"),
+        ("ODDSPAPI_KEY", "https://oddspapi.io — fără ea nu apar linkurile Superbet"),
     ]:
         status = "OK" if os.environ.get(key, "").strip() else f"LIPSĂ  -> obține de la {hint}"
         print(f"  {key:<20} {status}")

@@ -43,6 +43,8 @@ async def test_health_reports_sync_metadata(no_http):
     assert body["fixtures_in_db"] == 1
     assert body["timezone"] == "Europe/Bucharest"
     assert body["sync_enabled"] is False  # SYNC_ENABLED=false in teste
+    assert "oddspapi_key_set" in body
+    assert isinstance(body["oddspapi_key_set"], bool)
 
 
 async def test_health_budget_limit_matches_guard_effective_limit(no_http, monkeypatch):

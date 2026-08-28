@@ -1081,23 +1081,47 @@ def _sb_price_for_pick(sb: dict, market: Any, pick: Any) -> Optional[float]:
 async def apply_superbet_to_selections(selections: Optional[list]) -> None:
     """Pune cota + linkul Superbet pe selecțiile biletului, ocolind modelul.
 
-    Modelul uită adesea bookmaker_link și copiază «(Betano)». Aici
-    reatașăm după fixture_id + piață/pick, din memoria procesului sau din
-    snapshot-ul DB — deci merge și dacă /odds s-a terminat după bilet ori
-    procesul a fost repornit între timp."""
-    for s in selections or []:
+    Dacă prefetch-ul din analyze_matches n-a rulat (mod classic: doar
+    get_odds), tragem Superbet acum, cu același buget de timp. Fără
+    ODDSPAPI_KEY nu facem nimic în plus față de curățarea etichetei."""
+    if not selections:
+        return
+    for s in selections:
+        if isinstance(s, dict) and s.get("odds_label"):
+            s["odds_label"] = _HOUSE_PAREN.sub("", str(s["odds_label"])).strip()
+
+    missing: list[dict] = []
+    if enabled():
+        for s in selections:
+            if not isinstance(s, dict):
+                continue
+            try:
+                fid = int(s["fixture_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if _sb_cached(fid) or await _pack_from_db(fid):
+                continue
+            missing.append(s)
+        if missing:
+            tasks = []
+            for s in missing:
+                fx = await _fx_for_selection(s)
+                if fx:
+                    tasks.append(asyncio.create_task(superbet_for_fixture(fx)))
+            if tasks:
+                await asyncio.wait(tasks, timeout=WAIT_BUDGET_S)
+    else:
+        log.warning("OddsPapi: ODDSPAPI_KEY lipsă — biletul iese fără link Superbet")
+
+    n_link = 0
+    for s in selections:
         if not isinstance(s, dict):
             continue
-        label = s.get("odds_label")
-        if label:
-            s["odds_label"] = _HOUSE_PAREN.sub("", str(label)).strip()
         try:
             fid = int(s["fixture_id"])
         except (KeyError, TypeError, ValueError):
             continue
-        sb = _sb_cached(fid)
-        if not sb:
-            sb = await _pack_from_db(fid)
+        sb = _sb_cached(fid) or await _pack_from_db(fid)
         if not sb:
             continue
         link = str(sb.get("link") or "").strip()
@@ -1111,6 +1135,32 @@ async def apply_superbet_to_selections(selections: Optional[list]) -> None:
         if link:
             s["bookmaker_link"] = link
             s["bookmaker_name"] = BOOKMAKER_DISPLAY
+            n_link += 1
+    log.info("Superbet RO: %d/%d selecții cu link", n_link, len(selections))
+
+
+async def _fx_for_selection(s: dict) -> Optional[dict]:
+    """Fixture din DB, sau minimul necesar din selecție (mod classic)."""
+    try:
+        fid = int(s["fixture_id"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    try:
+        fx = await db.get_fixture(fid)
+    except Exception:
+        fx = None
+    if fx:
+        return fx
+    teams = _teams_from_match(s.get("match") or "")
+    if not teams:
+        return None
+    return {
+        "fixture_id": fid,
+        "home_name": teams[0],
+        "away_name": teams[1],
+        "kickoff_iso": s.get("kickoff"),
+        "league_name": s.get("league"),
+    }
 
 
 async def superbet_links_for_fixtures(fixture_ids: Optional[list] = None) -> list[dict]:
