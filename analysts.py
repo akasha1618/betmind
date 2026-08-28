@@ -30,6 +30,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 import db
 import football_data as fd
+import oddspapi_data as op
 from llm_compat import messages_create
 
 log = logging.getLogger("betmind.analysts")
@@ -170,6 +171,71 @@ def market_probs_consistency_warnings(probs: dict) -> list[str]:
     _check_eq(("draw", "away"), "dc_draw_away", "X2 vs DC X2")
     _check_eq(("home", "away"), "dc_home_away", "12 vs DC 12")
     return warnings
+
+
+_DC_KEYS = ("dc_home_draw", "dc_draw_away", "dc_home_away")
+_DC_FROM_1X2 = {
+    "dc_home_draw": ("home", "draw"),
+    "dc_draw_away": ("draw", "away"),
+    "dc_home_away": ("home", "away"),
+}
+
+
+def normalize_1x2_probs(probs: dict) -> dict:
+    """home+draw+away = 1, cu restul de rotunjire pe home. Fara 1X2 complet, neschimbat."""
+    if not isinstance(probs, dict):
+        return probs
+    out = dict(probs)
+    try:
+        home, draw, away = float(out["home"]), float(out["draw"]), float(out["away"])
+    except (KeyError, TypeError, ValueError):
+        return out
+    total = home + draw + away
+    if total <= 0:
+        return out
+    if abs(total - 1.0) < 0.0005:
+        return out
+    draw_n = round(draw / total, 4)
+    away_n = round(away / total, 4)
+    home_n = round(1.0 - draw_n - away_n, 4)
+    out["home"] = min(1.0, max(0.0, home_n))
+    out["draw"] = min(1.0, max(0.0, draw_n))
+    out["away"] = min(1.0, max(0.0, away_n))
+    return out
+
+
+def derive_double_chance_probs(probs: dict, odds: Optional[dict] = None) -> dict:
+    """DC = suma 1X2, DUPA normalizarea 1X2 la 1. Modelul nu estimeaza DC."""
+    if not isinstance(probs, dict):
+        return probs
+    out = {k: v for k, v in probs.items() if k not in _DC_FROM_1X2}
+    out = normalize_1x2_probs(out)
+    try:
+        home, draw, away = float(out["home"]), float(out["draw"]), float(out["away"])
+    except (KeyError, TypeError, ValueError):
+        return out
+    derived = {
+        "dc_home_draw": min(1.0, round(home + draw, 4)),
+        "dc_draw_away": min(1.0, round(draw + away, 4)),
+        "dc_home_away": min(1.0, round(home + away, 4)),
+    }
+    allowed = allowed_prob_keys(odds) if odds is not None else None
+    for key, val in derived.items():
+        if allowed is None or key in allowed:
+            out[key] = val
+    return out
+
+
+def _sync_double_chance_candidate_probs(analysis: dict) -> None:
+    """Aliniaza prob-ul candidatilor 1X2/DC la valorile normalizate din market_probs."""
+    probs = analysis.get("market_probs") or {}
+    sync_keys = set(_DC_KEYS) | {"home", "draw", "away"}
+    for c in analysis.get("best_candidates") or []:
+        mk = fd.normalize_market_name(c.get("market") or "") or (c.get("market") or "").lower()
+        pick = fd._normalize_outcome(mk, c.get("pick") or "") if mk else (c.get("pick") or "")
+        key = _prob_key_for(mk, pick)
+        if key in sync_keys and key in probs:
+            c["prob"] = probs[key]
 
 
 # ---------------------------------------------------------------------------
@@ -405,7 +471,12 @@ def _find_outcome(odds: Optional[dict], market: str, pick: str) -> Optional[dict
                 except (TypeError, ValueError):
                     return None
                 return {"value": val, "avg_odd": fo, "best_odd": fo,
-                        "best_bookmaker": odds.get("bookmaker"), "n_books": 1,
+                        "best_bookmaker": fd._real_book_name(odds.get("bookmaker")),
+                        "display_odd": fo,
+                        "display_bookmaker": fd._real_book_name(odds.get("bookmaker")),
+                        "odds_label": fd.format_odds_label(
+                            fo, fd._real_book_name(odds.get("bookmaker"))),
+                        "n_books": 1,
                         "reference_odd": fo}
     return None
 
@@ -429,12 +500,35 @@ def enrich_candidates(analysis: dict, odds: Optional[dict]) -> dict:
             c["avg_odds"] = round(avg, 3)
             c["implied_prob"] = round(implied, 3)
             c["edge"] = round(prob - implied, 3)
-            c["best_bookmaker"] = found.get("best_bookmaker")
             if found.get("best_odd"):
                 c["best_odd"] = found["best_odd"]
-            # Pe bilet folosim cota de referinta (casa preferata) daca exista.
+            if found.get("best_bookmaker"):
+                c["best_bookmaker"] = found["best_bookmaker"]
+            display_odd = found.get("display_odd")
+            display_book = found.get("display_bookmaker")
+            if display_odd is not None:
+                c["display_odd"] = display_odd
+            if display_book:
+                c["display_bookmaker"] = display_book
+            label = found.get("odds_label") or op.odds_label_with_link(
+                display_odd if display_odd is not None else found.get("best_odd"),
+                display_book,
+                found.get("bookmaker_link"),
+            )
+            if label:
+                c["odds_label"] = label
+            # Superbet RO (OddsPapi): linkul + numele casei merg pe selectie,
+            # iar cota folosita pe bilet devine exact cota Superbet — o
+            # singura sursa confirmata pentru numar, nume si link.
             ref = found.get("reference_odd") or found.get("best_odd")
-            if ref and not c.get("odds"):
+            if found.get("bookmaker_link"):
+                c["bookmaker_link"] = found["bookmaker_link"]
+            if found.get("bookmaker_name"):
+                c["bookmaker_name"] = found["bookmaker_name"]
+            if found.get("odds_source") == "superbet.ro" and ref:
+                c["odds"] = ref
+            elif ref and not c.get("odds"):
+                # Pe bilet (constructie) folosim cota de referinta daca lipseste.
                 c["odds"] = ref
         else:
             try:
@@ -443,6 +537,10 @@ def enrich_candidates(analysis: dict, odds: Optional[dict]) -> dict:
                 continue
             c.setdefault("implied_prob", round(implied, 3))
             c.setdefault("edge", round(prob - implied, 3))
+        pack_link = (odds or {}).get("superbet_link") if isinstance(odds, dict) else None
+        if pack_link and not c.get("bookmaker_link"):
+            c["bookmaker_link"] = pack_link
+            c["bookmaker_name"] = c.get("bookmaker_name") or "Superbet"
     return analysis
 
 
@@ -547,6 +645,13 @@ async def assemble_data_pack(fixture_id: int, league_packs: Optional[dict] = Non
     home_id, away_id = fx["home_id"], fx["away_id"]
     league_id, season = fx["league_id"], fx["season"]
 
+    # Cota Superbet RO (OddsPapi) pornește ACUM, în paralel cu apelurile
+    # API-Football de mai jos — latența ei se suprapune, nu se adună.
+    # Fără ODDSPAPI_KEY task-ul nu există și comportamentul e identic cu azi.
+    sb_task: Optional[asyncio.Task] = (
+        asyncio.create_task(op.superbet_for_fixture(fx)) if op.enabled() else None
+    )
+
     async def safe(name: str, coro):
         try:
             return await coro
@@ -579,6 +684,8 @@ async def assemble_data_pack(fixture_id: int, league_packs: Optional[dict] = Non
     # Cotele intai: fara ele meciul e inutil pentru bilet, iar burst-ul
     # de statistici le sufocea (rate limit pe /odds).
     odds = await safe("odds", fd.get_odds(fixture_id))
+    if isinstance(odds, dict) and odds.get("kind") == "no_odds_data":
+        gaps.append(odds.get("error") or fd.NO_ODDS_USER_MSG)
 
     rest = [
         safe("home_last_matches", fd.get_team_last_matches(home_id, 6)),
@@ -606,6 +713,22 @@ async def assemble_data_pack(fixture_id: int, league_packs: Optional[dict] = Non
         if not standings:
             return None
         return next((r for r in standings if r.get("team_id") == team_id), None)
+
+    if sb_task is not None:
+        # Buget strict: dacă Superbet nu a răspuns până acum + WAIT_BUDGET_S,
+        # renunțăm tăcut și rămân cotele API-Football (fără link).
+        sb = await op.wait_result(sb_task, op.WAIT_BUDGET_S)
+        if sb and isinstance(odds, dict) and not odds.get("error"):
+            n = op.overlay_on_odds_pack(odds, sb)
+            if n:
+                log.info("Superbet RO: %d cote suprascrise pentru fixture %s",
+                         n, fixture_id)
+            else:
+                log.info("Superbet RO: meci găsit, dar nicio piață overlay "
+                         "pentru fixture %s", fixture_id)
+        elif sb is None:
+            log.info("Superbet RO: indisponibil pentru fixture %s "
+                     "(potrivire / timeout / cote invalide)", fixture_id)
 
     kickoff_date = fx["date_local"]
     home_rest = await _days_since_last_match(home_id, kickoff_date, fixture_id)
@@ -670,7 +793,7 @@ Output ONLY a single valid JSON object — no prose, no markdown fences — with
 
 RULES:
 - LANGUAGE: every human-readable string (top_factors, angle, best_candidates[].reason, data_gaps) MUST be written in ROMANIAN — the app speaks Romanian and your exact numbers must survive untranslated. JSON keys, market names ("1X2", "Over 2.5", "GG") and enum values (confidence: high/medium/low) stay in English.
-- market_probs is a DYNAMIC map. Emit a probability ONLY for keys listed in the "allowed_prob_keys" block of the user message (those markets actually have odds). A key without odds is rejected. Typical keys when present: home, draw, away, over15, over25, under25, over35, btts_yes, dc_home_draw, dc_draw_away, dc_home_away, plus ah_*, team_total_*, team_scores_*, ht_*, over05_ht, over15_ht, first_score_*, htft_*.
+- market_probs is a DYNAMIC map. Emit a probability ONLY for keys listed in the "allowed_prob_keys" block of the user message (those markets actually have odds). A key without odds is rejected. Typical keys when present: home, draw, away, over15, over25, under25, over35, btts_yes, plus ah_*, team_total_*, team_scores_*, ht_*, over05_ht, over15_ht, first_score_*, htft_*. Do NOT emit dc_home_draw / dc_draw_away / dc_home_away — double chance is derived in code from 1X2 (home+draw, draw+away, home+away). You MAY still propose double-chance selections in best_candidates; their probabilities will be overwritten from 1X2.
 - Probabilities: blend 0.6 × implied-from-odds (1/avg_odd, normalized) + 0.4 × your statistical estimate from the pack. Never drift far above market without a strong stated reason.
 - best_candidates: 2-4 selections, ONLY for markets whose real odds appear in the pack (use reference_odd or avg_odd from the pack — never invent). No odds in pack => fewer or zero candidates.
 - MARKET FAMILIES: when the pack has at least 3 distinct families (result, goals, btts, double_chance, handicap, team-based, half-time), propose candidates from at least 3 of them. Safe-but-boring markets (double chance, over 1.5, team to score) are first-class options — not leftovers.
@@ -688,6 +811,8 @@ RULES:
 def build_analyst_prompt(odds: Optional[dict] = None) -> str:
     """Promptul de sistem + lista concreta de chei permise pentru meciul curent."""
     allowed = allowed_prob_keys(odds)
+    if allowed is not None:
+        allowed = {k for k in allowed if k not in _DC_KEYS}
     if allowed is None:
         extra = ("\n\nallowed_prob_keys: none (no odds in pack). "
                  "Emit market_probs as {} and zero or fewer candidates.")
@@ -947,9 +1072,24 @@ async def analyze_match(fixture_id: int, turn_id: Optional[str] = None,
             prev_text, prev_stop = text, stop_reason
             await _log_usage(turn_id, usage)
             raw = _extract_json(text)
-            validate_market_probs(raw.get("market_probs") or {}, pack.get("odds"))
+            probs = dict(raw.get("market_probs") or {})
+            for k in _DC_KEYS:
+                probs.pop(k, None)
+            raw["market_probs"] = probs
+            validate_market_probs(probs, pack.get("odds"))
             analysis = MatchAnalysis.model_validate(raw).model_dump()
             analysis["fixture_id"] = fixture_id  # nu lasam analistul sa-l schimbe
+            before = analysis.get("market_probs") or {}
+            try:
+                raw_1x2 = float(before["home"]) + float(before["draw"]) + float(before["away"])
+            except (KeyError, TypeError, ValueError):
+                raw_1x2 = 1.0
+            analysis["market_probs"] = derive_double_chance_probs(
+                analysis.get("market_probs") or {}, pack.get("odds"))
+            if abs(raw_1x2 - 1.0) > 0.02:
+                log.info("Analist fixture=%s 1X2 renormalizat: sum=%.3f -> 1.000",
+                         fixture_id, raw_1x2)
+            _sync_double_chance_candidate_probs(analysis)
             warns = market_probs_consistency_warnings(analysis.get("market_probs") or {})
             if warns:
                 log.warning("Analist fixture=%s market_probs inconsistente: %s",
@@ -997,6 +1137,7 @@ async def analyze_matches_events(fixture_ids: list[int], max_matches: int = 15,
                                  ) -> AsyncGenerator[tuple, None]:
     """
     Ruleaza analistii in paralel (Semaphore MAX_PARALLEL_ANALYSTS) si emite:
+      ("status", label)         — inainte de prefetch (clasamente/accidentari);
       ("progress", done, total) — dupa fiecare analiza terminata;
       ("result", dict)          — rezultatul agregat, la final.
     """
@@ -1007,6 +1148,9 @@ async def analyze_matches_events(fixture_ids: list[int], max_matches: int = 15,
         yield ("result", {"error": "Niciun fixture_id de analizat."})
         return
 
+    yield ("status", "Iau clasamentele și accidentările din ligile meciurilor…")
+    if op.enabled():
+        asyncio.create_task(op.prefetch_for_fixtures(ids))
     packs = await prefetch_league_packs(ids)
     token = _league_packs.set(packs)
     sem = asyncio.Semaphore(max_parallel_analysts())

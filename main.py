@@ -22,6 +22,7 @@ import asyncio
 import contextlib
 import json
 import os
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -417,6 +418,8 @@ async def _produce_turn(turn: turns.Turn, history: list[dict], start_len: int,
     """Ruleaza tura independent de conexiunea SSE (Safari in background)."""
     fd.set_current_turn(turn_id)
     partial: list[str] = []
+    t0 = time.monotonic()
+    latency_s: Optional[float] = None
     try:
         await turn.publish({
             "type": "meta", "conversation_id": conv_id, "turn_id": turn_id,
@@ -431,11 +434,15 @@ async def _produce_turn(turn: turns.Turn, history: list[dict], start_len: int,
             elif event.get("type") == "error":
                 log.error("Chat error event: %s", event.get("message"))
             await turn.publish(event)
+        latency_s = round(max(0.0, time.monotonic() - t0), 3)
         with contextlib.suppress(Exception):
+            await db.save_turn_latency(
+                turn_id, latency_s, fd.now_local().isoformat(timespec="seconds"))
             await turn.publish({
                 "type": "usage", "turn_id": turn_id,
                 **pricing.summarize(await db.usage_for_turn(turn_id)),
                 "api": fd.turn_api_stats(turn_id),
+                "latency_s": latency_s,
             })
     except asyncio.CancelledError:
         if turn.cancel_requested:
@@ -448,6 +455,11 @@ async def _produce_turn(turn: turns.Turn, history: list[dict], start_len: int,
         await turn.publish({"type": "error",
                             "message": f"Eroare de server: {type(e).__name__}: {e}"})
     finally:
+        if latency_s is None:
+            latency_s = round(max(0.0, time.monotonic() - t0), 3)
+            with contextlib.suppress(Exception):
+                await db.save_turn_latency(
+                    turn_id, latency_s, fd.now_local().isoformat(timespec="seconds"))
         try:
             await _persist_turn(conv_id, history, start_len, "".join(partial),
                                 first_turn, user_text, turn_id)
@@ -604,7 +616,8 @@ async def usage(turn_id: str):
     intamplat cu API-Football in tura respectiva (diagnostic pentru modul dev)."""
     rows = await db.usage_for_turn(turn_id)
     return {"turn_id": turn_id, **pricing.summarize(rows),
-            "api": fd.turn_api_stats(turn_id)}
+            "api": fd.turn_api_stats(turn_id),
+            "latency_s": await db.turn_latency(turn_id)}
 
 
 @app.post("/api/feedback")

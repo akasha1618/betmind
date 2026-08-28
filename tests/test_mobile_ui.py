@@ -59,3 +59,46 @@ def test_advanced_mode_starts_off_until_user_clicks():
     assert "default_mode === \"analysts\"" not in INDEX
     assert 'id="advBtn"' in INDEX
     assert "aria-pressed" in INDEX
+
+
+def test_dev_mode_shows_response_latency():
+    assert "function fmtLatency" in INDEX
+    assert "răspuns ${time}" in INDEX
+    assert "performance.now()" in INDEX
+    assert "latency_s" in INDEX
+
+
+def test_status_indicator_moves_to_end_and_does_not_force_scroll():
+    assert "function isNearBottom" in INDEX
+    assert "function maybeScrollDown" in INDEX
+    assert "thread.appendChild(status)" in INDEX
+    assert "isNearBottom(100)" in INDEX
+    assert "if (stick) scrollDown()" in INDEX
+
+
+def test_status_keep_alive_while_waiting_between_events():
+    """Dupa un delta, spinner-ul revine daca serverul tace (prefetch, Claude)."""
+    assert "armKeepAlive" in INDEX
+    assert "lastStatus" in INDEX
+    assert "setTimeout(() => {" in INDEX
+    assert "400" in INDEX
+    assert 'status.classList.add("hidden")' in INDEX
+    assert "clearTimeout(keepAlive)" in INDEX
+
+
+def test_external_links_open_in_a_new_tab():
+    """Click pe Superbet nu trebuie să părăsească conversația."""
+    assert 'addHook("afterSanitizeAttributes"' in INDEX
+    assert 'setAttribute("target", "_blank")' in INDEX
+    assert 'setAttribute("rel", "noopener noreferrer")' in INDEX
+
+
+def test_start_chips_keep_medium_first_and_original_rest():
+    assert "risc mediu" in INDEX
+    assert "cotă 5 pe weekendul acesta" in INDEX
+    assert "cât mai sigur" not in INDEX
+    assert "cele mai probabile" in INDEX
+    assert "function decorateTicketOdds" in INDEX
+    assert 'ev.type === "ticket_links"' in INDEX
+    assert "function _tableHeadingJs" in INDEX
+    assert "headingHit" in INDEX

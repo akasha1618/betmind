@@ -285,6 +285,9 @@ async def test_e2e_ticket_flow_streams_parallel_status(no_http, monkeypatch):
     statuses = [e["label"] for e in events if e["type"] == "status"]
     assert any("Analizez 2 meciuri în paralel" in s for s in statuses)
     assert any("(2/2 gata)" in s for s in statuses)
+    assert any("clasamentele" in s for s in statuses)
+    assert any("Pregătesc biletul" in s for s in statuses)
+    assert any("Scriu recomandarea" in s for s in statuses)
     deltas = "".join(e["text"] for e in events if e["type"] == "delta")
     assert "Biletul" in deltas
 
@@ -368,3 +371,41 @@ async def test_data_pack_computed_fields_from_local_store(no_http):
     assert pack["home"]["midweek_european_game"] is False
     assert pack["away"]["midweek_european_game"] is True
     assert pack["data_gaps"]  # apelurile API au cazut onest in gaps (buget epuizat)
+
+
+def test_after_tools_status_explains_the_wait():
+    assert "Pregătesc biletul" in agent._after_tools_status(["analyze_matches"])
+    assert "Scriu recomandarea" in agent._after_tools_status(["build_ticket"])
+    assert "programul" in agent._after_tools_status(["get_fixtures"])
+    assert agent._after_tools_status(["unknown_tool"]) == "Mă gândesc…"
+
+
+async def test_analyze_matches_status_before_prefetch(no_http, monkeypatch):
+    """Spinner-ul trebuie sa se miste inainte de GET /standings+/injuries."""
+    await db.init_db()
+    day = _today()
+    await _seed_fixture(101, day)
+    await db.budget_add(day, 50)
+
+    order: list[str] = []
+    real_prefetch = analysts.prefetch_league_packs
+
+    async def wrapped(ids):
+        order.append("prefetch")
+        return await real_prefetch(ids)
+
+    monkeypatch.setattr(analysts, "prefetch_league_packs", wrapped)
+
+    async def fake_llm(system, user):
+        fid = json.loads(user)["fixture"]["fixture_id"]
+        return _valid_analysis_json(fid), _fake_usage()
+
+    monkeypatch.setattr(analysts, "_call_analyst_llm", fake_llm)
+
+    events = [ev async for ev in analysts.analyze_matches_events([101], 15, "turn-x")]
+    assert events[0][0] == "status"
+    assert "clasamentele" in events[0][1]
+    assert order == ["prefetch"]
+    assert any(ev[0] == "progress" for ev in events)
+    assert events[-1][0] == "result"
+

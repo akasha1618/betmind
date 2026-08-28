@@ -12,6 +12,7 @@ Teste de acceptanta V1-E (control asupra conversatiei + transparenta cost):
 
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -297,6 +298,31 @@ async def test_turn_cost_includes_history_and_is_exposed_to_dev_mode(no_http, mo
         pricing.cost_of(agent.MODEL, 200, 100))
     assert api["cost_usd"] == usage[0]["cost_usd"]
     assert api["calls"] == 2
+    assert usage[0]["latency_s"] >= 0
+    assert api["latency_s"] == pytest.approx(usage[0]["latency_s"])
+
+
+async def test_dev_mode_latency_tracks_wall_clock(no_http, monkeypatch):
+    """Timpul de raspuns e de la startul turei pana la mesajul final."""
+    import main
+    main.SESSIONS.clear()
+    await db.init_db()
+
+    async def slow_turn(*args, **kwargs):
+        await asyncio.sleep(0.08)
+        yield {"type": "delta", "text": "gata"}
+        yield {"type": "done"}
+
+    monkeypatch.setattr(agent, "run_turn", slow_turn)
+
+    async with _client(main) as client:
+        events = _sse_events((await client.post("/api/chat", json={
+            "message": "salut", "user_key": "u-lat"})).text)
+        usage = [e for e in events if e["type"] == "usage"]
+        assert usage and usage[0]["latency_s"] >= 0.07
+        turn_id = events[0]["turn_id"]
+        api = (await client.get(f"/api/usage/{turn_id}")).json()
+        assert api["latency_s"] >= 0.07
 
 
 def _async_value(value):

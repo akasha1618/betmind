@@ -351,7 +351,7 @@ def test_prompt_covers_market_mix_edge_and_safe_alternative(monkeypatch, mode):
     monkeypatch.setenv("ORCHESTRATION_MODE", mode)
     p = prompts.build_system_prompt()
     assert "două rezultate finale" in p or "șansă dublă" in p
-    assert "media pieței" in p
+    assert "cea mai bună din piață" in p or "media pieței" in p
     assert "piața dă 61%" in p
     assert "over 1.5" in p.lower() or "șansă dublă" in p
     # Biletul sigur nu e doar 1X2 scurt.
@@ -410,3 +410,166 @@ def test_prompt_asks_for_concrete_step_messages():
     p = prompts.build_system_prompt()
     assert "Name the matches" in p
     assert "Never mention APIs" in p
+
+
+# ---------------------------------------------------------------------------
+# Casa de pariuri lângă cotă (afișare; construcția biletului neschimbată)
+# ---------------------------------------------------------------------------
+
+def test_format_odds_label_omits_house_when_name_missing():
+    assert fd.format_odds_label(1.85, "Superbet") == "1.85"
+    assert fd.format_odds_label(1.9, "  Superbet ") == "1.90"
+    assert fd.format_odds_label(1.85, "Bet365") == "1.85"
+    assert fd.format_odds_label(1.85, "Betano") == "1.85"
+    assert fd.format_odds_label(1.85, None) == "1.85"
+    assert fd.format_odds_label(1.85, "") == "1.85"
+    assert fd.format_odds_label(1.85, "?") == "1.85"
+
+
+def test_pick_display_quote_prefers_romanian_house_from_same_tuple():
+    quotes = [
+        (8, "Bet365", 1.90),
+        (34, "Superbet", 1.70),
+        (16, "Unibet", 1.88),
+    ]
+    odd, name = fd.pick_display_quote(quotes)
+    assert odd == 1.70 and name == "Superbet"
+
+
+def test_pick_display_quote_falls_back_to_best_when_no_ro_house():
+    quotes = [
+        (8, "Bet365", 1.80),
+        (11, "1xBet", 1.92),
+        (4, "Pinnacle", 1.85),
+    ]
+    odd, name = fd.pick_display_quote(quotes)
+    assert odd == 1.92 and name == "1xBet"
+
+
+def test_pick_display_quote_no_name_means_no_attribution():
+    quotes = [(99, "", 2.10), (8, "Bet365", 1.80)]
+    odd, name = fd.pick_display_quote(quotes)
+    # Bet365 e RO? Nu. Best e 2.10 la casa fără nume → cota fără atribuire.
+    assert odd == 2.10 and name is None
+
+
+async def test_displayed_odd_and_bookmaker_are_the_same_api_pair(fake_http):
+    """(a) Superbet 1.70 Home — afișarea e exact perechea din obiectul API."""
+    await db.init_db()
+    books = [
+        _book(8, "Bet365", 1.00),          # Home 1.80
+        _book(11, "1xBet", 1.10),          # Home 1.98 — cea mai bună
+        _book(34, "Superbet", 0.9444),     # Home ~1.70
+        _book(16, "Unibet", 1.05),
+    ]
+    fake_http.response_payload = [{"bookmakers": books}]
+    out = await fd.get_odds(4242)
+    home = next(o for m in out["markets"] if m["key"] == "1x2"
+                for o in m["outcomes"] if o["value"] == "Home")
+    assert home["display_odd"] == pytest.approx(1.70, abs=0.01)
+    assert home["display_bookmaker"] == "Superbet"
+    assert home["odds_label"] == fd.format_odds_label(
+        home["display_odd"], home["display_bookmaker"])
+    assert "Superbet" not in (home["odds_label"] or "")
+    assert home["odds_label"] == "1.70"
+    assert home["best_odd"] == pytest.approx(1.98, abs=0.01)
+    assert home["best_bookmaker"] == "1xBet"
+    # Construcția (reference) rămâne Bet365.
+    assert home["reference_odd"] == pytest.approx(1.80, abs=0.01)
+
+
+async def test_missing_bookmaker_name_shows_odd_without_attribution(fake_http):
+    """(b) Numele casei lipsește → doar cota, nicio casă ghicită."""
+    await db.init_db()
+    nameless = _book(99, "", 1.20)  # cea mai bună, dar fără nume
+    nameless["name"] = None
+    fake_http.response_payload = [{"bookmakers": [
+        _book(8, "Bet365", 1.00),
+        nameless,
+    ]}]
+    out = await fd.get_odds(4243)
+    home = next(o for m in out["markets"] if m["key"] == "1x2"
+                for o in m["outcomes"] if o["value"] == "Home")
+    assert "display_bookmaker" not in home
+    assert "(" not in (home.get("odds_label") or "")
+    assert home["odds_label"] == fd.format_odds_label(home["display_odd"], None)
+    for banned in ("Superbet", "Betano", "Unibet", "Bet365"):
+        assert banned not in (home.get("odds_label") or "")
+
+
+async def test_ro_priority_then_best_odd_fallback(fake_http):
+    """(c) Cu Superbet+Betano → Superbet; fără case RO → cea mai bună cotă."""
+    await db.init_db()
+    fake_http.response_payload = [{"bookmakers": [
+        _book(8, "Bet365", 1.00),
+        _book(32, "Betano", 0.95),
+        _book(34, "Superbet", 0.90),
+        _book(11, "1xBet", 1.20),
+    ]}]
+    with_ro = await fd.get_odds(1)
+    home = next(o for m in with_ro["markets"] if m["key"] == "1x2"
+                for o in m["outcomes"] if o["value"] == "Home")
+    assert home["display_bookmaker"] == "Superbet"
+    assert home["best_bookmaker"] == "1xBet"
+
+    fake_http.response_payload = [{"bookmakers": [
+        _book(8, "Bet365", 1.00),
+        _book(11, "1xBet", 1.15),
+        _book(4, "Pinnacle", 1.05),
+    ]}]
+    no_ro = await fd.get_odds(2)
+    home2 = next(o for m in no_ro["markets"] if m["key"] == "1x2"
+                 for o in m["outcomes"] if o["value"] == "Home")
+    assert home2["display_bookmaker"] == "1xBet"
+    assert home2["display_odd"] == home2["best_odd"]
+    assert home2["odds_label"] == fd.format_odds_label(
+        home2["display_odd"], "1xBet")
+
+
+def test_build_ticket_does_not_change_odds_when_passing_display_fields():
+    """Logica de construcție rămâne pe `odds`; eticheta e doar afișare."""
+    res = build_ticket([{
+        "fixture_id": 1, "match": "A vs B", "market": "1X2", "pick": "1",
+        "odds": 1.85, "prob": 0.55,
+        "display_odd": 1.70, "display_bookmaker": "Superbet",
+        "odds_label": "1.70 (Superbet)",
+    }], target_odds=1.8)
+    assert res["ok"]
+    sel = res["selections"][0]
+    assert sel["odds"] == 1.85
+    assert sel["odds_label"] == "1.70 (Superbet)"
+    assert sel["display_bookmaker"] == "Superbet"
+    assert res["total_odds"] == pytest.approx(1.85, abs=0.001)
+
+
+def test_enrich_copies_odds_label_from_the_same_outcome():
+    analysis = {
+        "confidence": "medium",
+        "best_candidates": [
+            {"market": "1X2", "pick": "Home", "odds": 1.80, "prob": 0.55,
+             "reason": "4W din 5 acasă"},
+        ],
+    }
+    pack = _odds_pack_1x2_ou25()
+    pack["markets"][0]["outcomes"][0].update({
+        "display_odd": 1.70, "display_bookmaker": "Superbet",
+        "odds_label": "1.70",
+    })
+    analysts.enrich_candidates(analysis, pack)
+    c = analysis["best_candidates"][0]
+    assert c["odds_label"] == "1.70"
+    assert c["display_bookmaker"] == "Superbet"
+    assert c["display_odd"] == 1.70
+    assert c["odds"] == 1.80  # neschimbat — construcția biletului
+    assert c["best_bookmaker"] == "Unibet"
+
+
+@pytest.mark.parametrize("mode", ["analysts", "classic"])
+def test_prompt_forbids_inventing_bookmaker_names(monkeypatch, mode):
+    monkeypatch.setenv("ORCHESTRATION_MODE", mode)
+    p = prompts.build_system_prompt()
+    assert "ODDS & BOOKMAKER HONESTY" in p
+    assert "odds_label" in p
+    assert "NEVER write bookmaker names" in p
+    assert "NEVER invent" in p
+

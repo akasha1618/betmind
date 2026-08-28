@@ -57,7 +57,9 @@
   .msg.bot li{margin:3px 0}
   .msg.bot strong{color:var(--green)}
   .msg.bot code{font-family:"JetBrains Mono",monospace; font-size:13px; background:var(--surface-2); padding:1px 5px; border-radius:5px}
-  .msg.bot a{color:var(--green)}
+  .msg.bot a{color:var(--green); text-decoration:underline; text-underline-offset:2px}
+  .msg.bot td a{display:inline; font-size:12px; margin-left:8px; font-weight:600; white-space:nowrap}
+  .msg.bot table td:nth-child(4){white-space:nowrap}
 
   /* tabelele = biletul: stil de betting slip */
   .msg.bot table{
@@ -308,7 +310,7 @@
       <p>Spune-mi perioada, cota țintă și nivelul de risc. Cercetez statistici, formă, accidentări și cote reale, apoi îți explic fiecare alegere.</p>
       <div class="chips">
         <button class="chip">Recomandă-mi un bilet cu cota 5 din meciurile de azi, risc mediu.</button>
-        <button class="chip">Vreau un bilet cât mai sigur pentru meciurile din weekend.</button>
+        <button class="chip">Vreau un bilet de cotă 5 pe weekendul acesta.</button>
         <button class="chip">Fă-mi un bilet cu cota 30 cu cele mai probabile meciuri din săptămâna asta.</button>
       </div>
     </div>
@@ -365,12 +367,129 @@ let serverConfig = { premium_gating: false, premium_active: false };
    inchide bold-ul in markdown si lasa asteriscurile la vedere. */
 marked.setOptions({ breaks: true, gfm: true });
 const fixBold = t => (t || "").replace(/\*\*(\S(?:[^*]|\*(?!\*))*?)[ \t]+\*\*/g, "**$1**");
+/* Linkurile (Superbet, etc.) se deschid in tab nou — altfel parasesti conversatia. */
+DOMPurify.addHook("afterSanitizeAttributes", node => {
+  if (node.tagName === "A" && node.getAttribute("href")) {
+    node.setAttribute("target", "_blank");
+    node.setAttribute("rel", "noopener noreferrer");
+  }
+});
 const md = t => DOMPurify.sanitize(marked.parse(fixBold(t)));
+
+function _normTeamJs(s) {
+  return (s || "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
+}
+const TEAM_NOISE = new Set(["fc","cf","cs","csm","csu","acs","afc","ac","as","sc","ssc","sv","us","ud","cd","ca","rc","fk","sk","bk","nk","kv","kaa","rcd","vfb","vfl","tsg","bsc","spvgg","calcio","club","olympique","borussia","le","de","the","sd"]);
+const TEAM_EXPAND = {utd:"united", man:"manchester", nottm:"nottingham", notts:"nottingham", wolves:"wolverhampton", spurs:"tottenham", psg:"paris", hamburger:"hamburg"};
+function _teamTokensJs(s) {
+  const n = _normTeamJs(s);
+  const raw = n.split(" ").filter(t => t && !/^\d+$/.test(t) && !TEAM_NOISE.has(t));
+  return raw.map(t => TEAM_EXPAND[t] || t);
+}
+function _teamHitsJs(team, line) {
+  const ta = _teamTokensJs(team), lineToks = _teamTokensJs(line);
+  if (!ta.length || !lineToks.length) return false;
+  const lineJoin = lineToks.join(" "), lineSet = new Set(lineToks);
+  if (lineJoin.includes(ta.join(" "))) return true;
+  const present = t => lineSet.has(t) || lineJoin.includes(t) ||
+    lineToks.some(lt => lt === t || (Math.min(t.length, lt.length) >= 6 && (lt.startsWith(t) || t.startsWith(lt))));
+  if (ta.every(present)) return true;
+  if (ta.some(t => t.length >= 6 && present(t))) return true;
+  return ta.some(t => t.length >= 4 && present(t));
+}
+function _rowMatchesMatch(rowText, match) {
+  const parts = (match || "").split(/\s+vs\.?\s+/i);
+  if (parts.length !== 2) return false;
+  return _teamHitsJs(parts[0], rowText) && _teamHitsJs(parts[1], rowText);
+}
+function _tableHeadingJs(table) {
+  let ctx = "";
+  let n = table && table.previousElementSibling;
+  let hops = 0;
+  while (n && hops < 4) {
+    ctx += " " + (n.innerText || "");
+    n = n.previousElementSibling;
+    hops++;
+  }
+  const cap = table && table.querySelector("caption");
+  if (cap) ctx += " " + (cap.innerText || "");
+  return ctx;
+}
+function _appendSuperbetJs(td, href) {
+  if (!td || td.querySelector("a[href*='superbet']")) return;
+  const a = document.createElement("a");
+  a.href = href; a.target = "_blank"; a.rel = "noopener noreferrer";
+  a.textContent = "→ Superbet";
+  td.appendChild(a);
+}
+function decorateTicketOdds(root, sels) {
+  if (!root) return;
+  root.querySelectorAll("table td").forEach(td => {
+    const t = td.textContent || "";
+    if (!/\d+[.,]\d+/.test(t) || t.includes("⭐")) return;
+    td.childNodes.forEach(n => {
+      if (n.nodeType === 3) {
+                n.textContent = n.textContent.replace(/\s*\(\s*[A-Za-z0-9][A-Za-z0-9 .+_-]{0,30}\s*\)/g, "");
+      }
+    });
+  });
+  root.querySelectorAll("table td a").forEach(a => {
+    const href = a.getAttribute("href") || "";
+    if (!/superbet\.ro/i.test(href)) return;
+    const raw = (a.textContent || "").trim();
+    if (/^\d+[.,]\d+/.test(raw) || raw.includes("(")) {
+      const oddTxt = raw.replace(/\s*→\s*Superbet.*$/i, "")
+        .replace(/\s*\(\s*[A-Za-z0-9][A-Za-z0-9 .+_-]{0,30}\s*\)/g, "").trim();
+      const neu = document.createElement("a");
+      neu.href = href; neu.target = "_blank"; neu.rel = "noopener noreferrer";
+      neu.textContent = "→ Superbet";
+      a.replaceWith(document.createTextNode(oddTxt + " "), neu);
+    } else if (raw !== "→ Superbet") {
+      a.textContent = "→ Superbet";
+    }
+  });
+  (sels || []).forEach(s => {
+    if (!s || !s.link) return;
+    root.querySelectorAll("table").forEach(table => {
+      const heading = _tableHeadingJs(table);
+      const rows = [...table.querySelectorAll("tr")].filter(tr => tr.querySelector("td"));
+      const rowHits = rows.filter(tr => _rowMatchesMatch(tr.innerText || "", s.match || ""));
+      const headingHit = _rowMatchesMatch(heading, s.match || "");
+      const targets = rowHits.length ? rowHits : (headingHit ? rows : []);
+      targets.forEach(tr => {
+        const cota = _cotaCellJs(tr);
+        if (cota) _appendSuperbetJs(cota, s.link);
+      });
+    });
+  });
+}
+/* Celula Cotă: dupa antetul coloanei, nu dupa "primul numar din rand" —
+   "Peste 2.5" din coloana Pariu contine si el un numar zecimal. */
+function _cotaCellJs(tr) {
+  const tds = [...tr.querySelectorAll("td")];
+  if (!tds.length) return null;
+  const table = tr.closest("table");
+  const ths = table ? [...table.querySelectorAll("th")] : [];
+  const idx = ths.findIndex(th => /cot[aă]/i.test(th.textContent || ""));
+  if (idx >= 0 && idx < tds.length
+      && /\d+[.,]\d+/.test(tds[idx].textContent || "")) return tds[idx];
+  for (let i = tds.length - 1; i >= 0; i--) {
+    const t = (tds[i].textContent || "").trim();
+    if (/^\d+[.,]\d+$/.test(t)) return tds[i];
+  }
+  return null;
+}
 
 /* ---- UI helpers ---- */
 function el(tag, cls, html) { const e = document.createElement(tag); if (cls) e.className = cls; if (html !== undefined) e.innerHTML = html; return e; }
 function icon(id, size) { return `<svg width="${size||14}" height="${size||14}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#${id}"/></svg>`; }
 function scrollDown() { chat.scrollTop = chat.scrollHeight; }
+function isNearBottom(px) {
+  px = px == null ? 100 : px;
+  return chat.scrollHeight - chat.scrollTop - chat.clientHeight <= px;
+}
+function maybeScrollDown() { if (isNearBottom(100)) scrollDown(); }
 function hideEmpty() { const e = $("#empty"); if (e) e.remove(); }
 
 /* Renumeroteaza bulele dupa orice modificare a firului (editare, reincarcare).
@@ -466,15 +585,36 @@ async function send(text, opts) {
   scrollDown();
 
   let bubble = null, buffer = "", stopped = false, turnId = null;
+  let ticketLinks = [];
   const turnBubbles = [];
-  const setStatus = l => { status.querySelector(".label").textContent = l; status.classList.remove("hidden"); };
+  const setStatus = l => {
+    lastStatus = l || lastStatus || "Mă gândesc…";
+    status.querySelector(".label").textContent = lastStatus;
+    status.classList.remove("hidden");
+    thread.appendChild(status);
+    clearTimeout(keepAlive);
+  };
   let complete = false;
   let eventCount = 0;
+  let lastStatus = "Mă gândesc…";
+  let keepAlive = null;
+  const t0 = performance.now();
+  let latencyS = null;
+
+  const armKeepAlive = () => {
+    clearTimeout(keepAlive);
+    if (complete) return;
+    keepAlive = setTimeout(() => {
+      if (complete) return;
+      setStatus(lastStatus || "Mă gândesc…");
+    }, 400);
+  };
 
   const applyEvent = ev => {
     eventCount += 1;
     if (inflight) inflight.eventCount = eventCount;
     if (ev.type === "delta") {
+      const stick = isNearBottom();
       if (!bubble) {
         bubble = el("div", "msg bot");
         if (turnId) bubble.dataset.turn = turnId;
@@ -485,8 +625,11 @@ async function send(text, opts) {
       status.classList.add("hidden");
       buffer += ev.text;
       bubble.innerHTML = md(buffer);
-      scrollDown();
+      decorateTicketOdds(bubble, ticketLinks);
+      armKeepAlive();
+      if (stick) scrollDown();
     } else if (ev.type === "snapshot") {
+      const stick = isNearBottom();
       if (!bubble) {
         bubble = el("div", "msg bot");
         if (turnId) bubble.dataset.turn = turnId;
@@ -497,7 +640,12 @@ async function send(text, opts) {
       status.classList.add("hidden");
       buffer = ev.text || "";
       bubble.innerHTML = md(buffer);
-      scrollDown();
+      decorateTicketOdds(bubble, ticketLinks);
+      armKeepAlive();
+      if (stick) scrollDown();
+    } else if (ev.type === "ticket_links") {
+      ticketLinks = ev.selections || [];
+      if (bubble) decorateTicketOdds(bubble, ticketLinks);
     } else if (ev.type === "meta") {
       conversationId = ev.conversation_id || conversationId;
       turnId = ev.turn_id || turnId;
@@ -505,21 +653,32 @@ async function send(text, opts) {
       if (ev.premium_required) showPremiumNotice();
     } else if (ev.type === "status") {
       bubble = null; buffer && (buffer = "");
+      const stick = isNearBottom();
       setStatus(ev.label);
-      scrollDown();
+      if (stick) scrollDown();
     } else if (ev.type === "usage") {
-      if (devMode) showCost(ev);
+      if (devMode) showCost({ ...ev, latency_s: latencyS != null ? latencyS : ev.latency_s });
     } else if (ev.type === "error") {
       complete = true;
+      clearTimeout(keepAlive);
+      if (latencyS == null) latencyS = (performance.now() - t0) / 1000;
+      const stick = isNearBottom();
       thread.appendChild(el("div", "error", DOMPurify.sanitize(ev.message)));
+      if (stick) scrollDown();
     } else if (ev.type === "done") {
       complete = true;
+      clearTimeout(keepAlive);
+      if (bubble) decorateTicketOdds(bubble, ticketLinks);
+      latencyS = (performance.now() - t0) / 1000;
+      if (devMode && turnId) showCost({ turn_id: turnId, latency_s: latencyS });
     }
   };
 
   async function resumeFrom(after) {
     if (!turnId) return;
+    const stick = isNearBottom();
     setStatus("Reconectez…");
+    if (stick) scrollDown();
     const resp = await fetch(
       "/api/turns/" + encodeURIComponent(turnId) + "/stream?after=" + after
         + "&user_key=" + encodeURIComponent(sessionId),
@@ -590,14 +749,20 @@ async function send(text, opts) {
       thread.appendChild(el("div", "error", "Nu am putut contacta serverul. Verifică dacă aplicația rulează."));
     }
   } finally {
+    complete = true;
+    clearTimeout(keepAlive);
     controller = null;
     inflight = null;
     status.remove();
     turnBubbles.forEach(b => { if (isTicketText(b.textContent)) addFeedback(b); });
     reindex();
     setSending(false);
-    if (devMode && turnId) setTimeout(() => refreshCost(turnId), stopped ? 1200 : 0);
-    scrollDown(); maybeFocusInput();
+    if (devMode && turnId) {
+      if (latencyS == null) latencyS = (performance.now() - t0) / 1000;
+      showCost({ turn_id: turnId, latency_s: latencyS });
+      setTimeout(() => refreshCost(turnId), stopped ? 1200 : 0);
+    }
+    maybeScrollDown(); maybeFocusInput();
     refreshConvList();
     setTimeout(refreshConvList, 2500);
   }
@@ -650,6 +815,15 @@ function startEdit(bubble) {
 /* ---- mod dezvoltator: costul intrebarii (cu tot cu istoric) ---- */
 function fmtTokens(n) { return n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n); }
 
+function fmtLatency(s) {
+  if (s == null || !Number.isFinite(Number(s)) || Number(s) < 0) return "";
+  s = Number(s);
+  if (s < 60) return s.toFixed(1) + "s";
+  const m = Math.floor(s / 60);
+  const sec = Math.round(s % 60);
+  return m + "m " + String(sec).padStart(2, "0") + "s";
+}
+
 function bubbleOfTurn(turnId) {
   const same = [...thread.querySelectorAll('.msg.bot[data-turn="' + turnId + '"]')];
   return same.pop() || [...thread.querySelectorAll(".msg.bot")].pop();
@@ -663,16 +837,26 @@ function showCost(u, bubble) {
     box = el("div", "devcost");
     anchor.after(box);
   }
-  // Toti cei patru contori se afiseaza: scrierea in cache costa mai mult decat
-  // intrarea obisnuita, iar fara ea totalul pare ca nu se potriveste cu suma.
+  u = Object.assign({}, box._dev || {}, u);
+  box._dev = u;
+  const kept = parseFloat(box.dataset.latency);
+  const latency = Number.isFinite(kept) && kept > 0
+    ? kept
+    : (u.latency_s != null ? Number(u.latency_s) : NaN);
+  if (Number.isFinite(latency) && latency >= 0) box.dataset.latency = String(latency);
+  const time = fmtLatency(box.dataset.latency);
   const total = (u.input_tokens || 0) + (u.output_tokens || 0) +
     (u.cache_read_tokens || 0) + (u.cache_write_tokens || 0);
-  box.innerHTML = `<b>$${(u.cost_usd || 0).toFixed(4)}</b> · ${fmtTokens(total)} tokeni: ` +
-    `${fmtTokens(u.input_tokens || 0)} intrare, ${fmtTokens(u.output_tokens || 0)} ieșire, ` +
-    `${fmtTokens(u.cache_read_tokens || 0)} citiți din cache, ` +
-    `${fmtTokens(u.cache_write_tokens || 0)} scriși în cache · ` +
-    `${u.calls || 0} apeluri${u.prices_exact === false ? " (preț aproximativ)" : ""}` +
-    apiLine(u.api);
+  const hasCost = u.calls || total || u.cost_usd;
+  const costBit = hasCost
+    ? `<b>$${(u.cost_usd || 0).toFixed(4)}</b> · ${fmtTokens(total)} tokeni: ` +
+      `${fmtTokens(u.input_tokens || 0)} intrare, ${fmtTokens(u.output_tokens || 0)} ieșire, ` +
+      `${fmtTokens(u.cache_read_tokens || 0)} citiți din cache, ` +
+      `${fmtTokens(u.cache_write_tokens || 0)} scriși în cache · ` +
+      `${u.calls || 0} apeluri${u.prices_exact === false ? " (preț aproximativ)" : ""}`
+    : "";
+  const timeBit = time ? `<b>răspuns ${time}</b>` : "";
+  box.innerHTML = [timeBit, costBit].filter(Boolean).join(" · ") + apiLine(u.api);
   box.title = (u.models || [])
     .map(m => `${m.model}: ${m.calls} apeluri, $${m.cost_usd.toFixed(4)}`).join("\n");
 }
@@ -703,7 +887,7 @@ async function refreshCost(turnId) {
   if (!turnId) return;
   try {
     const u = await (await fetch("/api/usage/" + encodeURIComponent(turnId))).json();
-    if (u.calls || (u.api && u.api.api_calls)) showCost(u, bubbleOfTurn(turnId));
+    if (u.calls || (u.api && u.api.api_calls) || u.latency_s != null) showCost(u, bubbleOfTurn(turnId));
   } catch (e) {}
 }
 
@@ -864,6 +1048,7 @@ async function loadConversation(id) {
       } else {
         const b = el("div", "msg bot", md(m.text));
         if (m.turn_id) b.dataset.turn = m.turn_id;
+        decorateTicketOdds(b, []);
         if (isTicketText(m.text)) addFeedback(b);
         thread.appendChild(b);
       }

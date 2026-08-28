@@ -3,7 +3,8 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    DATA_DIR=/data
+    DATA_DIR=/data \
+    MAX_TOKENS=128000
 
 # gosu: coborarea privilegiilor din entrypoint (root -> betmind), pastrand PID 1.
 RUN apt-get update \

@@ -44,6 +44,7 @@ SQLite trebuie să stea pe un disc care supraviețuiește redeploy-urilor.
 | `CLAUDE_MODEL` | modelul orchestratorului (ex. `claude-sonnet-4-5`) |
 | `ANALYST_MODEL` | modelul analiștilor de meci (ex. `claude-3-5-haiku-latest`) |
 | `APP_TIMEZONE` | `Europe/Bucharest` |
+| `MAX_TOKENS` | lungimea maximă a unui răspuns al coordonatorului (`128000` = plafonul Sonnet 4.6) |
 | `MAX_DAILY_API_REQUESTS` | bugetul zilnic API-Football (ex. `95`) |
 | `MAX_PARALLEL_ANALYSTS` | câți analiști rulează în paralel (ex. `3`) |
 | `ORCHESTRATION_MODE` | `standard` sau `advanced` |

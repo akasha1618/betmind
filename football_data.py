@@ -81,6 +81,12 @@ class BudgetExhausted(FootballDataError):
     """Bugetul zilnic de request-uri API a fost atins. Cade pe baza locala."""
 
 
+NO_ODDS_USER_MSG = (
+    "Casele de pariuri nu au publicat încă cote pentru acest meci "
+    "(de obicei se deschid cu 2-3 zile înainte)."
+)
+
+
 # ---------------------------------------------------------------------------
 # Diagnostic: vizibilitate pe esecurile API-Football (nu schimba comportamentul)
 #
@@ -1152,7 +1158,14 @@ async def get_predictions(fixture_id: int) -> dict:
     }
 
 
-_PREFERRED_BOOKMAKERS = [8, 6, 11, 1]  # Bet365, apoi fallback-uri
+_PREFERRED_BOOKMAKERS = [8, 6, 11, 1]  # Bet365, apoi fallback-uri (referinta pentru media/ranking)
+# Case observate live pe /odds (aug 2026) care operează și în România,
+# în ordinea cerută de produs. Doar acestea — restul listei RO nu apare în API.
+_RO_PREFERRED_BOOKS: tuple[tuple[int, str], ...] = (
+    (34, "superbet"),
+    (32, "betano"),
+    (16, "unibet"),
+)
 # Chei legacy (V1): pastrate neschimbate pentru clientii existenti.
 _LEGACY_MARKETS = {"Match Winner": "1X2", "Goals Over/Under": "over_under",
                    "Both Teams Score": "btts", "Double Chance": "double_chance"}
@@ -1345,6 +1358,65 @@ def _prune_outcomes(key: str, outcomes: list[dict]) -> list[dict]:
     return outcomes
 
 
+def format_odds_label(odd: Optional[float], bookmaker: Optional[str]) -> Optional[str]:
+    """Doar numărul („1.85”). Nicio casă în paranteză — Superbet e butonul
+    «→ Superbet», celelalte case nu se afișează pe bilet."""
+    if odd is None:
+        return None
+    try:
+        return f"{float(odd):.2f}"
+    except (TypeError, ValueError):
+        return None
+
+
+def _real_book_name(name: Any) -> Optional[str]:
+    """Numele exact din API; gol / '?' nu e o casă."""
+    if not isinstance(name, str):
+        return None
+    cleaned = name.strip()
+    if not cleaned or cleaned == "?":
+        return None
+    return cleaned
+
+
+def _quote_name(quote: tuple) -> Optional[str]:
+    return _real_book_name(quote[1] if len(quote) > 1 else None)
+
+
+def pick_display_quote(quotes: list[tuple]) -> tuple[float, Optional[str]]:
+    """Alege (cotă, casă) din ACEEAȘI listă de cotații, aceeași preluare.
+
+    Preferă Superbet → Betano → Unibet dacă apar (id sau nume exact din API).
+    Altfel: cea mai bună cotă, cu numele casei din același tuplu.
+    Fără nume real → (cotă, None) — nu se ghicește casa.
+    """
+    if not quotes:
+        raise ValueError("pick_display_quote: lista de cotații e goală")
+    indexed: dict[int, tuple] = {}
+    named: dict[str, tuple] = {}
+    for q in quotes:
+        qid = q[0] if q else None
+        qname = _quote_name(q)
+        qodd = q[2] if len(q) > 2 else q[-1]
+        if isinstance(qid, int) and qid not in indexed:
+            indexed[qid] = (qodd, qname)
+        if qname:
+            named.setdefault(qname.lower(), (qodd, qname))
+    for pref_id, pref_key in _RO_PREFERRED_BOOKS:
+        if pref_id in indexed:
+            odd, name = indexed[pref_id]
+            return float(odd), name
+        if pref_key in named:
+            odd, name = named[pref_key]
+            return float(odd), name
+    best_odd = max(float(q[2] if len(q) > 2 else q[-1]) for q in quotes)
+    for q in quotes:
+        odd = float(q[2] if len(q) > 2 else q[-1])
+        if odd == best_odd:
+            return odd, _quote_name(q)
+    return best_odd, None
+
+
 def _legacy_from_bookmaker(chosen: dict) -> dict[str, Any]:
     """Structura veche (un singur bookmaker, 4 piete) — neschimbata."""
     out: dict[str, Any] = {"bookmaker": chosen.get("name")}
@@ -1377,11 +1449,12 @@ def aggregate_odds(bookmakers: list[dict]) -> dict[str, Any]:
     if not chosen:
         return {"error": "Fara bookmakeri disponibili pentru acest meci."}
 
-    # (market_key, outcome) -> list[(book_name, odd)]
-    buckets: dict[tuple[str, str], list[tuple[str, float]]] = {}
+    # (market_key, outcome) -> list[(book_id, book_name, odd)]
+    buckets: dict[tuple[str, str], list[tuple[Any, Optional[str], float]]] = {}
     labels: dict[str, str] = {}
     for book in bookmakers:
-        bname = book.get("name") or "?"
+        bname = _real_book_name(book.get("name"))
+        bid = book.get("id")
         for bet in book.get("bets") or []:
             raw_name = _as_text(bet.get("name"))
             key = normalize_market_name(raw_name)
@@ -1393,28 +1466,36 @@ def aggregate_odds(bookmakers: list[dict]) -> dict[str, Any]:
                 if odd is None:
                     continue
                 outcome = _normalize_outcome(key, v.get("value"))
-                buckets.setdefault((key, outcome), []).append((bname, odd))
+                buckets.setdefault((key, outcome), []).append((bid, bname, odd))
 
-    ref_name = chosen.get("name")
+    ref_name = _real_book_name(chosen.get("name"))
     markets: list[dict[str, Any]] = []
     for key in {k for k, _ in buckets}:
         outcomes = []
         for (mk, outcome), quotes in buckets.items():
             if mk != key:
                 continue
-            odds = [o for _, o in quotes]
+            odds = [o for _, _, o in quotes]
             avg = sum(odds) / len(odds)
             best = max(odds)
-            best_book = next(n for n, o in quotes if o == best)
-            ref = next((o for n, o in quotes if n == ref_name), None)
-            outcomes.append({
+            best_quote = next(q for q in quotes if q[2] == best)
+            best_book = _quote_name(best_quote)
+            display_odd, display_book = pick_display_quote(quotes)
+            ref = next((o for _id, n, o in quotes if n == ref_name), None) if ref_name else None
+            row: dict[str, Any] = {
                 "value": outcome,
                 "avg_odd": round(avg, 3),
                 "best_odd": round(best, 3),
-                "best_bookmaker": best_book,
                 "n_books": len(quotes),
                 "reference_odd": round(ref, 3) if ref is not None else None,
-            })
+                "display_odd": round(display_odd, 3),
+            }
+            if best_book:
+                row["best_bookmaker"] = best_book
+            if display_book:
+                row["display_bookmaker"] = display_book
+            row["odds_label"] = format_odds_label(display_odd, display_book)
+            outcomes.append(row)
         outcomes = _prune_outcomes(key, outcomes)
         if not outcomes or len(outcomes) > _MAX_OUTCOMES:
             continue
@@ -1444,7 +1525,7 @@ async def get_odds(fixture_id: int) -> dict:
         # «nu exista cote» arata altfel decat «am fost limitat».
         _record_api_error("/odds", "no_odds_data", 200, "response=[] (fara cote publicate)",
                           None, {"fixture": fixture_id})
-        return {"error": "Nu exista cote pentru acest meci (posibil prea devreme sau liga neacoperita)."}
+        return {"error": NO_ODDS_USER_MSG, "kind": "no_odds_data"}
     books = raw[0].get("bookmakers") or []
     try:
         return aggregate_odds(books)

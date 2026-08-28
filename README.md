@@ -82,7 +82,7 @@ betmind/
 | Variabilă | Implicit | Rol |
 |---|---|---|
 | `CLAUDE_MODEL` | `claude-sonnet-4-6` | Modelul folosit. `claude-haiku-4-5-20251001` = mai ieftin, analize mai simple. |
-| `MAX_TOKENS` | `4096` | Lungimea maximă a unui răspuns. |
+| `MAX_TOKENS` | `128000` | Lungimea maximă a unui răspuns al coordonatorului (plafonul modelului). |
 | `PORT` | `8000` | Portul serverului. |
 
 ## 8. Probleme frecvente

@@ -26,12 +26,70 @@ log = logging.getLogger("betmind.agent")
 import analysts
 import db
 import football_data as fd
+import oddspapi_data as op
 from prompts import build_system_prompt
-from ticket_builder import build_ticket
+from ticket_builder import build_ticket, parse_selection_request, annotate_same_match_menu
 
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
-MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "4096"))
 MAX_AGENT_ITERATIONS = 25
+MAX_COORDINATOR_CONTINUES = 1
+
+# Ture consecutive terminate cu max_tokens, per conversatie. La 2, tura
+# urmatoare nu mai reia aceeasi strategie — raspuns scurt si cerere de restrangere.
+_max_tokens_streak: dict[str, int] = {}
+
+_CONTINUE_PROMPT = (
+    "Continuă EXACT de unde te-ai oprit, fără să repeți ce-ai scris. "
+    "Fii scurt: detalii doar pentru selecțiile de pe bilet; "
+    "meciurile evitate — maximum o linie fiecare; "
+    "nu relua analizele meciurilor care nu sunt pe bilet."
+)
+_TRUNCATED_USER_MSG = (
+    "Răspunsul a fost prea lung și s-a tăiat. "
+    "Reformulez mai concis: cere un bilet pe scurt, sau restrânge cererea "
+    "(mai puține meciuri sau o singură ligă)."
+)
+_LOOP_ABORT_MSG = (
+    "Am încercat de două ori și răspunsul tot iese prea lung pentru această cerere. "
+    "Restrânge: mai puține meciuri analizate sau un bilet mai simplu "
+    "(o ligă, cotă mai mică). Apoi trimite din nou."
+)
+
+
+# Plafonul Messages API pentru claude-sonnet-4-6 (max output sincron).
+_MAX_TOKENS_CEILING = 128_000
+
+
+def max_tokens() -> int:
+    """Tokeni de ieșire ai coordonatorului — implicit maximul modelului (128k)."""
+    try:
+        n = int(os.environ.get("MAX_TOKENS", str(_MAX_TOKENS_CEILING)))
+    except ValueError:
+        n = _MAX_TOKENS_CEILING
+    return max(256, min(n, _MAX_TOKENS_CEILING))
+
+
+# Compat: importatorii vechi citesc constanta la load; run_turn foloseste functia.
+MAX_TOKENS = max_tokens()
+
+
+def _streak_key(conversation_id: str | None) -> str:
+    return conversation_id or "_anon"
+
+
+def _reset_max_tokens_streak(conversation_id: str | None) -> None:
+    _max_tokens_streak.pop(_streak_key(conversation_id), None)
+
+
+def _bump_max_tokens_streak(conversation_id: str | None) -> int:
+    key = _streak_key(conversation_id)
+    n = _max_tokens_streak.get(key, 0) + 1
+    _max_tokens_streak[key] = n
+    return n
+
+
+def _should_abort_max_tokens_loop(conversation_id: str | None) -> bool:
+    return _max_tokens_streak.get(_streak_key(conversation_id), 0) >= 2
 
 # ---------------------------------------------------------------------------
 # Definitiile tool-urilor (JSON Schema pentru Claude)
@@ -170,7 +228,9 @@ TOOLS: list[dict] = [
         "name": "build_ticket",
         "description": ("Construieste deterministic biletul optim din candidatii dati, ca sa atinga cota tinta "
                         "cu probabilitate maxima. Trimite TOTI candidatii promitatori (poti trimite mai multi decat "
-                        "vor intra in bilet); functia alege combinatia. Max o selectie per meci."),
+                        "vor intra in bilet); functia alege combinatia. Max o selectie per meci. "
+                        "Daca userul cere un numar de meciuri/selectii, treci-l in target_selections "
+                        "(sau min_selections daca e vag). Fara acesti parametri, se opreste la cota tinta."),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -196,12 +256,32 @@ TOOLS: list[dict] = [
                             "avg_odds": {"type": "number"},
                             "best_bookmaker": {"type": "string"},
                             "best_odd": {"type": "number"},
+                            "display_odd": {"type": "number"},
+                            "display_bookmaker": {"type": "string"},
+                            "odds_label": {"type": "string",
+                                           "description": "doar numărul, ex: '1.85' — fără nume de casă"},
+                            "bookmaker_link": {"type": "string",
+                                               "description": "link direct către meci la casa de pariuri — copiază exact, nu inventa"},
+                            "bookmaker_name": {"type": "string"},
                         },
                         "required": ["fixture_id", "match", "market", "pick", "odds", "prob"],
                     },
                 },
                 "target_odds": {"type": "number"},
                 "max_selections": {"type": "integer", "description": "implicit 15"},
+                "min_selections": {
+                    "type": "integer",
+                    "description": ("Minim de selecții pe bilet. Folosește când userul vrea "
+                                    "mai multe meciuri fără un număr exact («prea puține», "
+                                    "«vreau mai multe»). Implicit absent = greedy-ul actual."),
+                },
+                "target_selections": {
+                    "type": "integer",
+                    "description": ("Numărul EXACT de selecții cerut de user "
+                                    "(«bilet cu 5 selecții», «5 meciuri pe bilet»). "
+                                    "Algoritmul continuă până la N chiar dacă cota țintă e "
+                                    "deja atinsă și NU taie selecțiile extra."),
+                },
                 "excluded_fixture_ids": {
                     "type": "array", "items": {"type": "integer"},
                     "description": ("fixture_id-uri EXCLUSE. Completeaza-l DOAR cand userul "
@@ -436,6 +516,19 @@ async def status_label(name: str, args: Optional[dict] = None,
     return STATUS_LABELS.get(name, "Lucrez…")
 
 
+def _after_tools_status(tool_names: list[str]) -> str:
+    """Ce se vede cât Claude gândește, între un tool și mesajul următor."""
+    if "analyze_matches" in tool_names:
+        return "Pregătesc biletul din analizele meciurilor…"
+    if "build_ticket" in tool_names:
+        return "Scriu recomandarea…"
+    if "get_fixtures" in tool_names:
+        return "Mă uit la programul de meciuri…"
+    if "get_odds" in tool_names:
+        return "Compar cotele și aleg variantele…"
+    return "Mă gândesc…"
+
+
 async def _batch_status(name: str, blocks: list) -> str:
     """O linie de deschidere cand modelul cere acelasi tip de date pentru mai multi."""
     if name == "get_odds":
@@ -507,9 +600,18 @@ async def _get_my_tickets(user_key: str | None, days: Any) -> dict:
                      "in acest interval — nu inventa.")}
 
 
+def _latest_user_text(messages: list[dict]) -> str:
+    for m in reversed(messages or []):
+        content = m.get("content")
+        if m.get("role") == "user" and isinstance(content, str) and content.strip():
+            return content
+    return ""
+
+
 async def _execute_tool(name: str, args: dict[str, Any],
                         conversation_id: str | None = None,
-                        user_key: str | None = None) -> Any:
+                        user_key: str | None = None,
+                        user_text: str | None = None) -> Any:
     """Ruleaza tool-ul cerut. Erorile devin payload {'error': ...} pentru agent."""
     try:
         if name == "get_fixtures":
@@ -533,9 +635,18 @@ async def _execute_tool(name: str, args: dict[str, Any],
         if name == "get_odds":
             return await fd.get_odds(args["fixture_id"])
         if name == "build_ticket":
+            parsed = parse_selection_request(user_text or "")
+            target_sel = args.get("target_selections")
+            min_sel = args.get("min_selections")
+            if target_sel is None:
+                target_sel = parsed.get("target_selections")
+            if min_sel is None:
+                min_sel = parsed.get("min_selections")
             result = build_ticket(args["candidates"], args["target_odds"],
                                   args.get("max_selections", 15),
-                                  args.get("excluded_fixture_ids"))
+                                  args.get("excluded_fixture_ids"),
+                                  min_selections=min_sel,
+                                  target_selections=target_sel)
             # V1-C: fiecare bilet prezentat se persista (alimenteaza track
             # record-ul V2). ticket_id e referinta interna — promptul interzice
             # mentionarea stocarii catre user.
@@ -604,6 +715,59 @@ def _serializable_content(message) -> list[dict]:
     return blocks
 
 
+def _fixture_ids_from_tool(name: str, args: dict, result: Any) -> list[int]:
+    """Fixture-urile văzute în tură — pentru link Superbet și fără build_ticket."""
+    ids: list[int] = []
+    if name == "analyze_matches":
+        ids.extend(args.get("fixture_ids") or [])
+        if isinstance(result, dict):
+            for a in result.get("analyses") or []:
+                if isinstance(a, dict) and a.get("fixture_id"):
+                    ids.append(a["fixture_id"])
+    elif name in ("get_odds", "get_fixture", "get_team_last_matches",
+                  "get_h2h", "get_injuries"):
+        if args.get("fixture_id"):
+            ids.append(args["fixture_id"])
+    elif name == "build_ticket" and isinstance(result, dict):
+        for s in result.get("selections") or []:
+            if isinstance(s, dict) and s.get("fixture_id"):
+                ids.append(s["fixture_id"])
+    out: list[int] = []
+    seen: set[int] = set()
+    for raw in ids:
+        try:
+            fid = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if fid not in seen:
+            seen.add(fid)
+            out.append(fid)
+    return out
+
+
+def _inject_ticket_links(assistant_msg: dict, selections: list) -> Optional[str]:
+    """Linkuri Superbet + nota «nu e bilet combinat» pe meniurile de pe un meci."""
+    if not isinstance(assistant_msg, dict):
+        return None
+    content = assistant_msg.get("content")
+    if not isinstance(content, list):
+        return None
+    idxs = [i for i, b in enumerate(content)
+            if isinstance(b, dict) and b.get("type") == "text"]
+    if not idxs:
+        return None
+    combined = "".join(content[i].get("text") or "" for i in idxs)
+    patched = op.inject_bookmaker_links(combined, selections)
+    patched = annotate_same_match_menu(patched)
+    if patched == combined:
+        return None
+    content[idxs[0]] = {**content[idxs[0]], "text": patched}
+    for i in idxs[1:]:
+        content[i] = {**content[i], "text": ""}
+    assistant_msg["content"] = content
+    return patched
+
+
 def _with_cache_markers(system_prompt: str, tools: list[dict],
                         messages: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
     """
@@ -652,23 +816,43 @@ async def run_turn(messages: list[dict],
         return
 
     base_url = os.environ.get("ANTHROPIC_BASE_URL", "").strip() or "https://api.anthropic.com"
+    token_cap = max_tokens()
     log.info(
         "Anthropic call start model=%s max_tokens=%s messages=%d base_url=%s key_prefix=%s…",
-        MODEL, MAX_TOKENS, len(messages), base_url, api_key[:12],
+        MODEL, token_cap, len(messages), base_url, api_key[:12],
     )
 
     client = AsyncAnthropic(api_key=api_key)
     system_prompt = build_system_prompt(mode)
     tools = build_tools(mode)
     turn_id = turn_id or uuid.uuid4().hex
+    continues = 0
+    last_ticket_selections: list = []
+    analyzed_fixture_ids: list[int] = []
 
     try:
+        if _should_abort_max_tokens_loop(conversation_id):
+            log.warning(
+                "max_tokens loop: %s consecutive truncated turns in conv=%s — abort",
+                _max_tokens_streak.get(_streak_key(conversation_id), 0),
+                conversation_id or "anon",
+            )
+            yield {"type": "status", "label": "Cererea generează prea mult text…"}
+            yield {"type": "delta", "text": _LOOP_ABORT_MSG}
+            messages.append({"role": "assistant",
+                             "content": [{"type": "text", "text": _LOOP_ABORT_MSG}]})
+            _reset_max_tokens_streak(conversation_id)
+            yield {"type": "done"}
+            return
+
         for iteration in range(MAX_AGENT_ITERATIONS):
+            if iteration == 0:
+                yield {"type": "status", "label": "Mă gândesc…"}
             log.debug("Anthropic stream iteration=%d", iteration + 1)
             system_c, tools_c, messages_c = _with_cache_markers(system_prompt, tools, messages)
             async with client.messages.stream(
                 model=MODEL,
-                max_tokens=MAX_TOKENS,
+                max_tokens=token_cap,
                 system=system_c,
                 tools=tools_c,
                 messages=messages_c,
@@ -698,7 +882,53 @@ async def run_turn(messages: list[dict],
 
             messages.append({"role": "assistant", "content": _serializable_content(final)})
 
+            if final.stop_reason == "max_tokens":
+                out_tok = final.usage.output_tokens if final.usage else "?"
+                if continues < MAX_COORDINATOR_CONTINUES:
+                    continues += 1
+                    log.warning(
+                        "Coordinator stop_reason=max_tokens output_tokens=%s — "
+                        "continue %s/%s conv=%s",
+                        out_tok, continues, MAX_COORDINATOR_CONTINUES,
+                        conversation_id or "anon",
+                    )
+                    # content lista: _render_messages nu-l arata ca mesaj al userului
+                    messages.append({
+                        "role": "user",
+                        "content": [{"type": "text", "text": _CONTINUE_PROMPT}],
+                    })
+                    continue
+                log.warning(
+                    "Coordinator still truncated after continue "
+                    "output_tokens=%s conv=%s — stop and tell the user",
+                    out_tok, conversation_id or "anon",
+                )
+                _bump_max_tokens_streak(conversation_id)
+                notice = "\n\n" + _TRUNCATED_USER_MSG
+                yield {"type": "status", "label": "Răspunsul a fost prea lung…"}
+                yield {"type": "delta", "text": _TRUNCATED_USER_MSG}
+                last = messages[-1]
+                if last.get("role") == "assistant" and isinstance(last.get("content"), list):
+                    last["content"] = list(last["content"]) + [
+                        {"type": "text", "text": notice},
+                    ]
+                yield {"type": "done"}
+                return
+
             if final.stop_reason != "tool_use":
+                _reset_max_tokens_streak(conversation_id)
+                if not any(isinstance(s, dict) and s.get("bookmaker_link")
+                           for s in last_ticket_selections):
+                    extra = await op.superbet_links_for_fixtures(analyzed_fixture_ids)
+                    if extra:
+                        last_ticket_selections = extra
+                links = [{"match": s.get("match"), "link": s.get("bookmaker_link")}
+                         for s in last_ticket_selections if s.get("bookmaker_link")]
+                if links:
+                    yield {"type": "ticket_links", "selections": links}
+                patched = _inject_ticket_links(messages[-1], last_ticket_selections)
+                if patched is not None:
+                    yield {"type": "snapshot", "text": patched}
                 yield {"type": "done"}
                 return
 
@@ -719,14 +949,20 @@ async def run_turn(messages: list[dict],
                     ids = args.get("fixture_ids") or []
                     max_m = args.get("max_matches", 15)
                     n = min(len(ids), max(1, max_m)) or 1
-                    names = _join_ro([await _match_label(fid) for fid in ids[:n]])
-                    who = f": {names}" if names else ""
                     yield {"type": "status",
-                           "label": f"Analizez {n} meciuri în paralel{who} — formă, cote, accidentări și H2H."}
+                           "label": (f"Analizez {n} meciuri în paralel "
+                                     "— formă, cote, accidentări și H2H.")}
+                    names = _join_ro([await _match_label(fid) for fid in ids[:n]])
+                    if names:
+                        yield {"type": "status",
+                               "label": (f"Analizez {n} meciuri în paralel: {names} "
+                                         "— formă, cote, accidentări și H2H.")}
                     result: Any = {"error": "analyze_matches nu a produs rezultat."}
                     try:
                         async for ev in analysts.analyze_matches_events(ids, max_m, turn_id):
-                            if ev[0] == "progress":
+                            if ev[0] == "status":
+                                yield {"type": "status", "label": ev[1]}
+                            elif ev[0] == "progress":
                                 done_n, total_n = ev[1], ev[2]
                                 just = ev[3] if len(ev) > 3 else ""
                                 tail = f" — gata {just}" if just else ""
@@ -750,14 +986,26 @@ async def run_turn(messages: list[dict],
                            "label": await status_label(block.name, block.input or {},
                                                        index=idx, total=len(siblings))}
                     result = await _execute_tool(block.name, block.input or {},
-                                                 conversation_id, user_key)
+                                                 conversation_id, user_key,
+                                                 user_text=_latest_user_text(messages))
                 log.debug("Tool result %s: %s", block.name, json.dumps(result, ensure_ascii=False)[:500])
+                analyzed_fixture_ids.extend(_fixture_ids_from_tool(
+                    block.name, block.input or {}, result))
+                if (block.name == "build_ticket" and isinstance(result, dict)
+                        and result.get("selections")):
+                    await op.apply_superbet_to_selections(result["selections"])
+                    last_ticket_selections = result["selections"]
+                    links = [{"match": s.get("match"), "link": s.get("bookmaker_link")}
+                             for s in last_ticket_selections if s.get("bookmaker_link")]
+                    if links:
+                        yield {"type": "ticket_links", "selections": links}
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
                     "content": json.dumps(result, ensure_ascii=False, default=str),
                 })
             messages.append({"role": "user", "content": tool_results})
+            yield {"type": "status", "label": _after_tools_status([b.name for b in tool_blocks])}
 
         yield {"type": "error",
                "message": "Am atins limita de pași pentru această cerere. Încearcă o cerere mai simplă."}

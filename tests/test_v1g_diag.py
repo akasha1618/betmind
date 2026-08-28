@@ -144,7 +144,9 @@ async def test_missing_odds_is_not_an_error_kind(fake_http):
 
     out = await fd.get_odds(999)
 
-    assert "error" in out
+    assert out["kind"] == "no_odds_data"
+    assert "2-3 zile" in out["error"]
+    assert "defecțiune" not in out["error"].lower()
     assert fd.last_api_error("/odds")["kind"] == "no_odds_data"
 
 

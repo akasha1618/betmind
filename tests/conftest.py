@@ -56,6 +56,20 @@ def isolated_env(tmp_path, monkeypatch):
     fd.reset_http_gate()
     import analysts
     analysts._league_packs.set(None)
+    # OddsPapi: implicit oprit in teste (comportament identic cu lipsa cheii);
+    # testele lui il pornesc explicit. Stare de modul resetata per test.
+    monkeypatch.delenv("ODDSPAPI_KEY", raising=False)
+    # Potrivirea LLM din prefetch ar chema API-ul real: oprita implicit,
+    # testele ei o simuleaza patch-uind functia.
+    monkeypatch.setenv("ODDSPAPI_LLM_MATCH", "0")
+    import oddspapi_data as op
+    op._markets_mem = None
+    op._markets_mem_at = 0.0
+    op._last_odds_call = 0.0
+    op._fixtures_cache.clear()
+    op._odds_lock = asyncio.Lock()
+    op._markets_lock = asyncio.Lock()
+    op._fixtures_lock = asyncio.Lock()
     yield
 
 

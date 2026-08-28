@@ -152,6 +152,37 @@ CREATE TABLE IF NOT EXISTS messages(
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, id);
 
+-- Durata perceputa a turei (de la startul producer-ului pana la raspunsul final).
+CREATE TABLE IF NOT EXISTS turn_stats(
+    turn_id    TEXT PRIMARY KEY,
+    latency_s  REAL,
+    created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS oddspapi_cache(
+    key        TEXT PRIMARY KEY,
+    json       TEXT NOT NULL,
+    fetched_at TEXT NOT NULL
+);
+
+-- Maparea persistentă fixture API-Football <-> fixture OddsPapi.
+-- Potrivim O DATĂ (nume/slate/LLM), apoi identitatea e un ID, nu stringuri.
+CREATE TABLE IF NOT EXISTS oddspapi_fixture_map(
+    af_fixture_id  INTEGER PRIMARY KEY,
+    opp_fixture_id TEXT,               -- NULL = căutat și negăsit (nu re-încerca imediat)
+    method         TEXT,               -- 'name' | 'slate' | 'llm' | 'none'
+    confidence     REAL,
+    created_at     TEXT NOT NULL
+);
+
+-- Snapshot-ul cotelor Superbet per fixture: linkul de pe bilet nu mai
+-- depinde de cache-ul din memoria procesului sau de timing.
+CREATE TABLE IF NOT EXISTS superbet_packs(
+    af_fixture_id INTEGER PRIMARY KEY,
+    json          TEXT NOT NULL,
+    fetched_at    TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS feedback(
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     conversation_id TEXT,
@@ -533,6 +564,94 @@ async def budget_floor(day: str, used: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Cache persistent OddsPapi (/markets se schimba rar — refresh saptamanal)
+# ---------------------------------------------------------------------------
+
+async def oddspapi_cache_get(key: str) -> Optional[dict]:
+    conn = await _connect()
+    try:
+        cur = await conn.execute(
+            "SELECT json, fetched_at FROM oddspapi_cache WHERE key = ?", (key,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+    finally:
+        await conn.close()
+
+
+async def oddspapi_cache_set(key: str, json_text: str, fetched_at: str) -> None:
+    conn = await _connect()
+    try:
+        await conn.execute(
+            "INSERT INTO oddspapi_cache(key, json, fetched_at) VALUES(?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET json = excluded.json, "
+            "fetched_at = excluded.fetched_at",
+            (key, json_text, fetched_at),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
+async def oddspapi_map_get(af_fixture_id: int) -> Optional[dict]:
+    conn = await _connect()
+    try:
+        cur = await conn.execute(
+            "SELECT af_fixture_id, opp_fixture_id, method, confidence, created_at "
+            "FROM oddspapi_fixture_map WHERE af_fixture_id = ?", (af_fixture_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+    finally:
+        await conn.close()
+
+
+async def oddspapi_map_set(af_fixture_id: int, opp_fixture_id: Optional[str],
+                           method: str, confidence: float,
+                           created_at: str) -> None:
+    conn = await _connect()
+    try:
+        await conn.execute(
+            "INSERT INTO oddspapi_fixture_map"
+            "(af_fixture_id, opp_fixture_id, method, confidence, created_at) "
+            "VALUES(?, ?, ?, ?, ?) "
+            "ON CONFLICT(af_fixture_id) DO UPDATE SET "
+            "opp_fixture_id = excluded.opp_fixture_id, method = excluded.method, "
+            "confidence = excluded.confidence, created_at = excluded.created_at",
+            (af_fixture_id, opp_fixture_id, method, confidence, created_at),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
+async def superbet_pack_get(af_fixture_id: int) -> Optional[dict]:
+    conn = await _connect()
+    try:
+        cur = await conn.execute(
+            "SELECT json, fetched_at FROM superbet_packs WHERE af_fixture_id = ?",
+            (af_fixture_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+    finally:
+        await conn.close()
+
+
+async def superbet_pack_set(af_fixture_id: int, json_text: str,
+                            fetched_at: str) -> None:
+    conn = await _connect()
+    try:
+        await conn.execute(
+            "INSERT INTO superbet_packs(af_fixture_id, json, fetched_at) "
+            "VALUES(?, ?, ?) "
+            "ON CONFLICT(af_fixture_id) DO UPDATE SET json = excluded.json, "
+            "fetched_at = excluded.fetched_at",
+            (af_fixture_id, json_text, fetched_at),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Ligi urmarite
 # ---------------------------------------------------------------------------
 
@@ -879,6 +998,32 @@ async def usage_for_turn(turn_id: str) -> list[dict]:
             (turn_id,),
         )
         return [dict(r) for r in await cur.fetchall()]
+    finally:
+        await conn.close()
+
+
+async def save_turn_latency(turn_id: str, latency_s: float, now: str) -> None:
+    conn = await _connect()
+    try:
+        await conn.execute(
+            "INSERT INTO turn_stats(turn_id, latency_s, created_at) VALUES(?, ?, ?) "
+            "ON CONFLICT(turn_id) DO UPDATE SET latency_s = excluded.latency_s",
+            (turn_id, float(latency_s), now),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
+async def turn_latency(turn_id: str) -> Optional[float]:
+    conn = await _connect()
+    try:
+        cur = await conn.execute(
+            "SELECT latency_s FROM turn_stats WHERE turn_id = ?", (turn_id,))
+        row = await cur.fetchone()
+        if row is None or row["latency_s"] is None:
+            return None
+        return float(row["latency_s"])
     finally:
         await conn.close()
 

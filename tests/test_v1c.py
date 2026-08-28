@@ -53,6 +53,92 @@ def test_build_ticket_excludes_fixtures_and_still_reaches_target():
     assert res_all["ok"] is True and res_all["excluded_fixture_ids"] == []
 
 
+def test_build_ticket_one_selection_per_match():
+    """Două piețe pe același meci nu pot intra pe un bilet combinat."""
+    candidates = [
+        {"fixture_id": 1, "match": "Juve vs Parma", "market": "1X2", "pick": "Home",
+         "odds": 1.26, "prob": 0.72},
+        {"fixture_id": 1, "match": "Juve vs Parma", "market": "htft", "pick": "Home/Home",
+         "odds": 1.76, "prob": 0.52},
+        {"fixture_id": 2, "match": "A vs B", "market": "Over 1.5", "pick": "Over 1.5",
+         "odds": 1.40, "prob": 0.68},
+    ]
+    res = build_ticket(candidates, target_odds=1.5)
+    assert res["ok"] is True
+    ids = [s["fixture_id"] for s in res["selections"]]
+    assert ids.count(1) == 1
+    assert set(ids) <= {1, 2}
+
+
+def test_annotate_same_match_menu_pe_tabel_exotic():
+    from ticket_builder import annotate_same_match_menu, SAME_MATCH_MENU_NOTE
+    md = (
+        "🎯 12 Pariuri Exotice — Juventus vs Parma\n\n"
+        "| # | PIAȚĂ | SELECȚIE | COTĂ | TIP |\n"
+        "|---|-------|----------|------|-----|\n"
+        "| 1 | Câștigătoare | Juventus | 1.26 | Clasic |\n"
+        "| 2 | HT/FT | Juve/Juve | 1.76 | Combinat |\n"
+    )
+    out = annotate_same_match_menu(md)
+    assert SAME_MATCH_MENU_NOTE in out
+    assert annotate_same_match_menu(out) == out  # idempotent
+
+
+def test_annotate_nu_atinge_biletul_clasic():
+    from ticket_builder import annotate_same_match_menu
+    md = (
+        "| # | Meci (ziua, ora) | Pariu | Cotă | Încredere |\n"
+        "| 1 | Juventus vs Parma · 21:45 | Victorie | 1.26 | ⭐⭐⭐ |\n"
+        "| 2 | Inter vs Como · 18:00 | Over 1.5 | 1.40 | ⭐⭐ |\n"
+        "\n**Cotă totală: 1.76**\n"
+    )
+    assert annotate_same_match_menu(md) == md
+
+
+def test_parse_selection_request_ignores_odds_target():
+    from ticket_builder import parse_selection_request
+    assert parse_selection_request("Recomandă-mi un bilet cu cota 5 din meciurile de azi") == {}
+    assert parse_selection_request("fă-mi un bilet cu 5 selecții") == {"target_selections": 5}
+    assert parse_selection_request("vreau mai multe meciuri pe bilet") == {"min_selections": 5}
+    assert parse_selection_request("prea puține meciuri") == {"min_selections": 5}
+
+
+def test_target_selections_keeps_five_and_reports_raw_product():
+    """Când userul cere 5 selecții, nu ne oprim la 3 doar pentru că s-a atins cota."""
+    candidates = [
+        {"fixture_id": i, "match": f"M{i} vs X", "market": "1X2", "pick": "1",
+         "odds": round(2.40 - i * 0.05, 2), "prob": 0.50, "confidence": "medium",
+         "kickoff": f"2026-08-23T{10 + i}:00"}
+        for i in range(8)
+    ]
+    compact = build_ticket(candidates, target_odds=11)
+    assert compact["selections_count"] == 3
+    assert compact["honesty"] is None
+
+    res = build_ticket(candidates, target_odds=11, target_selections=5)
+    assert res["ok"] is True
+    assert res["selections_count"] == 5
+    assert res["total_odds"] >= 11 * 0.999
+    expected = 1.0
+    for s in res["selections"]:
+        expected *= s["prob"]
+    assert res["estimated_probability"] == pytest.approx(expected, abs=1e-4)
+    assert res["honesty"]
+    assert res["honesty"]["compact_selections"] == 3
+    assert "5 selecții în loc de 3" in res["honesty"]["user_message"]
+
+
+def test_target_selections_warns_when_not_enough_candidates():
+    candidates = [
+        {"fixture_id": i, "match": f"M{i} vs X", "market": "1X2", "pick": "1",
+         "odds": 2.0, "prob": 0.5}
+        for i in range(3)
+    ]
+    res = build_ticket(candidates, target_odds=5, target_selections=5)
+    assert res["selections_count"] == 3
+    assert any("5" in w and "3" in w for w in res["warnings"])
+
+
 # ---------------------------------------------------------------------------
 # (b) persistenta biletului la generare
 # ---------------------------------------------------------------------------
@@ -162,7 +248,12 @@ def test_prompt_contains_banned_phrases_and_romania_time_rule(monkeypatch, mode)
     assert "excluded_fixture_ids" in prompt   # regula de editare a biletului
     assert "Verifică pe cont propriu" in prompt
     assert "⭐⭐⭐" in prompt                    # stelele de incredere
-    assert "NEVER mention ticket_id" in prompt
+    assert "LENGTH DISCIPLINE" in prompt
+    assert "1500" in prompt
+    assert "MAXIMUM one short line per avoided match" in prompt
+    assert "SAME MATCH vs TICKET" in prompt
+    assert "Bet Builder" in prompt
+    assert "one selection per match" in prompt
     # Degradare gratioasa in classic: stelele au fallback din p propriu.
     assert "degrade gracefully" in prompt
 
@@ -262,6 +353,9 @@ def test_coordinator_must_not_improvise_after_failed_analyses(monkeypatch):
     assert "NEVER compensate for failed analyses" in p
     assert "how many matches could not be analyzed" in p
     assert "preseason-friendly" in p
+    assert "target_selections" in p
+    assert "honesty.user_message" in p
+    assert "bookmakers have not published odds" in p
 
 
 def test_data_gaps_stringified_json_array_is_accepted():
@@ -297,15 +391,31 @@ def test_market_probs_consistency_warns_but_does_not_reject():
     assert good == []
 
 
+def test_double_chance_is_derived_from_1x2_not_the_model():
+    derived = analysts.derive_double_chance_probs(
+        {"home": 0.45, "draw": 0.28, "away": 0.27, "dc_home_draw": 0.10})
+    assert derived["dc_home_draw"] == pytest.approx(0.73, abs=0.0001)
+    assert derived["dc_draw_away"] == pytest.approx(0.55, abs=0.0001)
+    assert derived["dc_home_away"] == pytest.approx(0.72, abs=0.0001)
+    prompt = analysts.build_analyst_prompt({
+        "double_chance": {"Home/Draw": 1.4},
+        "1X2": {"Home": 2.0, "Draw": 3.0, "Away": 4.0},
+    })
+    _, _, allowed_list = prompt.partition("allowed_prob_keys:")
+    assert "dc_home_draw" not in allowed_list
+    assert "derived in code from 1X2" in analysts._ANALYST_SYSTEM_PROMPT
+
+
 async def test_inconsistent_probs_downgrade_confidence_not_fail(no_http, monkeypatch):
+    """O/U sau BTTS strâmbe coboară încrederea; 1X2 se normalizează, nu eșuează."""
     await db.init_db()
     await _seed_fixture(1, _today())
     await db.budget_add(_today(), 50)
 
     blob = json.loads(_valid_analysis_json(1))
     blob["confidence"] = "high"
-    blob["market_probs"] = {"home": 0.9, "draw": 0.2, "away": 0.2,
-                            "over25": 0.55, "under25": 0.45, "btts_yes": 0.5}
+    blob["market_probs"] = {"home": 0.45, "draw": 0.28, "away": 0.27,
+                            "over25": 0.8, "under25": 0.1, "btts_yes": 0.5}
 
     async def fake_llm(system, user):
         return json.dumps(blob), _fake_usage()
@@ -314,6 +424,74 @@ async def test_inconsistent_probs_downgrade_confidence_not_fail(no_http, monkeyp
     res = await analysts.analyze_match(1)
     assert res.get("analysis_failed") is not True
     assert res["confidence"] == "low"
+
+
+async def test_1x2_sum_over_one_is_normalized_not_failed(no_http, monkeypatch):
+    """Cazul din producție: home+draw+away=1.07 — renormalizat, DC din 1X2."""
+    await db.init_db()
+    await _seed_fixture(1, _today())
+    await db.budget_add(_today(), 50)
+
+    blob = json.loads(_valid_analysis_json(1))
+    blob["confidence"] = "high"
+    blob["market_probs"] = {
+        "home": 0.50, "draw": 0.30, "away": 0.27,
+        "over25": 0.55, "under25": 0.45, "btts_yes": 0.5,
+        "dc_home_draw": 0.40,
+    }
+
+    async def fake_llm(system, user):
+        return json.dumps(blob), _fake_usage()
+
+    monkeypatch.setattr(analysts, "_call_analyst_llm", fake_llm)
+    res = await analysts.analyze_match(1)
+    assert res.get("analysis_failed") is not True
+    assert res["confidence"] == "high"
+    mp = res["market_probs"]
+    assert mp["home"] + mp["draw"] + mp["away"] == pytest.approx(1.0, abs=0.001)
+    assert mp["dc_home_draw"] == pytest.approx(mp["home"] + mp["draw"], abs=0.0001)
+    assert mp["dc_home_draw"] <= 1.0
+
+
+def test_1x2_normalized_before_double_chance():
+    derived = analysts.derive_double_chance_probs(
+        {"home": 0.50, "draw": 0.30, "away": 0.27, "dc_home_draw": 0.10})
+    assert derived["home"] + derived["draw"] + derived["away"] == pytest.approx(1.0, abs=0.001)
+    assert derived["dc_home_draw"] == pytest.approx(
+        derived["home"] + derived["draw"], abs=0.0001)
+    assert derived["dc_draw_away"] == pytest.approx(
+        derived["draw"] + derived["away"], abs=0.0001)
+    assert derived["dc_home_away"] == pytest.approx(
+        derived["home"] + derived["away"], abs=0.0001)
+
+
+async def test_inconsistent_double_chance_does_not_downgrade_when_1x2_ok(no_http, monkeypatch):
+    """DC greșit de la model e rescris din 1X2 — nu mai degradează analize bune."""
+    await db.init_db()
+    await _seed_fixture(1, _today())
+    await db.budget_add(_today(), 50)
+
+    blob = json.loads(_valid_analysis_json(1))
+    blob["confidence"] = "high"
+    blob["market_probs"] = {
+        "home": 0.45, "draw": 0.28, "away": 0.27,
+        "over25": 0.55, "under25": 0.45, "btts_yes": 0.5,
+        "dc_home_draw": 0.10, "dc_draw_away": 0.10, "dc_home_away": 0.10,
+    }
+    blob["best_candidates"] = [{
+        "market": "double_chance", "pick": "home/draw", "odds": 1.40,
+        "prob": 0.10, "reason": "Gazdele au 4W din 5 acasă (11-3)",
+    }]
+
+    async def fake_llm(system, user):
+        return json.dumps(blob), _fake_usage()
+
+    monkeypatch.setattr(analysts, "_call_analyst_llm", fake_llm)
+    res = await analysts.analyze_match(1)
+    assert res.get("analysis_failed") is not True
+    assert res["confidence"] == "high"
+    assert res["market_probs"]["dc_home_draw"] == pytest.approx(0.73, abs=0.0001)
+    assert res["best_candidates"][0]["prob"] == pytest.approx(0.73, abs=0.0001)
 
 
 # ---------------------------------------------------------------------------
