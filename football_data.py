@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import time
+import unicodedata
 from collections import OrderedDict, deque
 from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
@@ -64,6 +65,10 @@ TTL = {
     "last_matches": 60 * 60,
     "leagues": 24 * 3600,
     "predictions": 6 * 3600,
+    "squads": 12 * 3600,
+    "transfers": 6 * 3600,
+    "lineups": 15 * 60,
+    "player_search": 12 * 3600,
 }
 
 _cache: dict[str, tuple[float, Any]] = {}
@@ -1109,6 +1114,256 @@ async def get_league_injuries_by_team(league_id: int, season: int) -> dict[int, 
         if tid is not None:
             teams.add(tid)
     return {tid: _injuries_pack_from_raw(raw, tid) for tid in teams}
+
+
+_POS_SHORT = {
+    "goalkeeper": "G", "defender": "D", "midfielder": "M", "attacker": "A",
+}
+
+
+def _pos_short(position: Any) -> str:
+    return _POS_SHORT.get(str(position or "").strip().lower(), str(position or "")[:1].upper() or "?")
+
+
+def _norm_player_name(value: Any) -> str:
+    s = unicodedata.normalize("NFKD", str(value or ""))
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return re.sub(r"[^a-z0-9 ]+", " ", s.lower()).strip()
+
+
+def player_name_matches(query: str, name: str) -> bool:
+    """Potrivire relaxată: 'Haaland' ≈ 'Erling Haaland', diacritice ignorate."""
+    q, n = _norm_player_name(query), _norm_player_name(name)
+    if not q or not n:
+        return False
+    if q == n or q in n or n in q:
+        return True
+    q_toks = [t for t in q.split() if len(t) >= 3]
+    n_toks = n.split()
+    if q_toks and all(any(t == nt or t in nt or nt in t for nt in n_toks) for t in q_toks):
+        return True
+    return False
+
+
+def _parse_iso_date(value: Any) -> Optional[date]:
+    s = str(value or "")[:10]
+    try:
+        return date.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def _squad_pack(raw: Any, team_id: int) -> dict:
+    item = raw[0] if isinstance(raw, list) and raw else (raw if isinstance(raw, dict) else {})
+    team = item.get("team") or {}
+    players = []
+    for p in item.get("players") or []:
+        name = (p.get("name") or "").strip()
+        if not name:
+            continue
+        players.append({
+            "id": p.get("id"),
+            "name": name,
+            "pos": _pos_short(p.get("position")),
+            "no": p.get("number"),
+            "age": p.get("age"),
+        })
+    return {
+        "team_id": team.get("id") or team_id,
+        "team": team.get("name"),
+        "count": len(players),
+        "players": players,
+    }
+
+
+async def get_team_squad(team_id: int) -> dict:
+    """Lotul curent al echipei (/players/squads). Sursa de adevăr: cine e ACUM."""
+    raw = await _get("/players/squads", {"team": team_id}, "squads")
+    if not raw:
+        return {"team_id": team_id, "count": 0, "players": [],
+                "error": "Fără lot publicat pentru această echipă."}
+    return _squad_pack(raw, team_id)
+
+
+def _transfer_row(player_name: str, move: dict, side: str) -> Optional[dict]:
+    teams = move.get("teams") or {}
+    other = teams.get("out" if side == "in" else "in") or {}
+    when = move.get("date")
+    if not player_name:
+        return None
+    return {
+        "name": player_name,
+        "date": when,
+        "type": move.get("type"),
+        "from" if side == "in" else "to": other.get("name"),
+        "from_id" if side == "in" else "to_id": other.get("id"),
+    }
+
+
+async def get_team_transfers(team_id: int, days: int = 90) -> dict:
+    """Transferuri recente (in/out) pe ultimele `days` zile."""
+    days = max(14, min(int(days or 90), 180))
+    raw = await _get("/transfers", {"team": team_id}, "transfers")
+    cutoff = date.today() - timedelta(days=days)
+    incoming: list[dict] = []
+    outgoing: list[dict] = []
+    for item in raw or []:
+        pname = ((item.get("player") or {}).get("name") or "").strip()
+        for move in item.get("transfers") or []:
+            when = _parse_iso_date(move.get("date"))
+            if when is None or when < cutoff:
+                continue
+            teams = move.get("teams") or {}
+            in_id = ((teams.get("in") or {}).get("id"))
+            out_id = ((teams.get("out") or {}).get("id"))
+            if in_id == team_id:
+                row = _transfer_row(pname, move, "in")
+                if row:
+                    incoming.append(row)
+            if out_id == team_id:
+                row = _transfer_row(pname, move, "out")
+                if row:
+                    outgoing.append(row)
+    incoming.sort(key=lambda r: r.get("date") or "", reverse=True)
+    outgoing.sort(key=lambda r: r.get("date") or "", reverse=True)
+    return {
+        "team_id": team_id,
+        "since_days": days,
+        "in": incoming[:15],
+        "out": outgoing[:15],
+    }
+
+
+def _lineup_side(entry: dict) -> dict:
+    start, bench = [], []
+    for row in entry.get("startXI") or []:
+        p = (row.get("player") or {})
+        if p.get("name"):
+            start.append(p["name"])
+    for row in entry.get("substitutes") or []:
+        p = (row.get("player") or {})
+        if p.get("name"):
+            bench.append(p["name"])
+    return {
+        "team": ((entry.get("team") or {}).get("name")),
+        "formation": entry.get("formation"),
+        "startxi": start,
+        "bench": bench[:11],
+    }
+
+
+def _kickoff_within_hours(kickoff_iso: Any, hours: float) -> bool:
+    dt = None
+    try:
+        dt = datetime.fromisoformat(str(kickoff_iso).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo(os.environ.get("APP_TIMEZONE", "Europe/Bucharest")))
+    now = datetime.now(dt.tzinfo)
+    return abs((dt - now).total_seconds()) <= hours * 3600
+
+
+async def get_lineups(fixture_id: int) -> dict:
+    """XI confirmat, când casele/API-ul l-au publicat (de obicei ~1h înainte)."""
+    raw = await _get("/fixtures/lineups", {"fixture": fixture_id}, "lineups")
+    if not raw:
+        return {"published": False, "fixture_id": fixture_id}
+    sides = [_lineup_side(x) for x in raw if isinstance(x, dict)]
+    if not any(s.get("startxi") for s in sides):
+        return {"published": False, "fixture_id": fixture_id}
+    out = {"published": True, "fixture_id": fixture_id}
+    if sides:
+        out["home"] = sides[0]
+    if len(sides) > 1:
+        out["away"] = sides[1]
+    return out
+
+
+def _find_in_squad(query: str, squad: dict) -> list[dict]:
+    hits = []
+    for p in squad.get("players") or []:
+        if player_name_matches(query, p.get("name") or ""):
+            hits.append(p)
+    return hits
+
+
+async def lookup_player(name: str, team_id: Optional[int] = None) -> dict:
+    """Răspunde 'joacă acum la echipa X?' din lot + transferuri, nu din memorie.
+
+    Cu team_id: verifică lotul acelei echipe (și out-urile recente).
+    Fără team_id: caută profilul, apoi lotul curent al jucătorului."""
+    query = (name or "").strip()
+    if len(query) < 3:
+        return {"error": "Numele trebuie să aibă cel puțin 3 litere."}
+
+    if team_id is not None:
+        squad = await get_team_squad(int(team_id))
+        hits = _find_in_squad(query, squad)
+        transfers = await get_team_transfers(int(team_id))
+        left = [t for t in (transfers.get("out") or [])
+                if player_name_matches(query, t.get("name") or "")]
+        arrived = [t for t in (transfers.get("in") or [])
+                   if player_name_matches(query, t.get("name") or "")]
+        if hits:
+            return {
+                "query": query,
+                "at_team": True,
+                "team_id": squad.get("team_id") or team_id,
+                "team": squad.get("team"),
+                "player": hits[0],
+                "other_matches": hits[1:5],
+            }
+        if left:
+            return {
+                "query": query,
+                "at_team": False,
+                "team_id": team_id,
+                "team": squad.get("team"),
+                "left": left[0],
+                "note": "Nu e în lotul actual; apare la plecările recente.",
+            }
+        return {
+            "query": query,
+            "at_team": False,
+            "team_id": team_id,
+            "team": squad.get("team"),
+            "arrived_recently": arrived[:3],
+            "note": "Nu e în lotul actual al acestei echipe.",
+        }
+
+    profiles = await _get("/players/profiles", {"search": query}, "player_search")
+    candidates = []
+    for item in (profiles or [])[:8]:
+        p = item.get("player") or item
+        pname = p.get("name")
+        if not pname:
+            continue
+        candidates.append({"id": p.get("id"), "name": pname,
+                           "nationality": p.get("nationality")})
+    if not candidates:
+        return {"query": query, "at_team": None,
+                "note": "Nu am găsit un jucător cu acest nume în baza de date."}
+
+    exact = [c for c in candidates if player_name_matches(query, c["name"])]
+    pick = exact[0] if exact else candidates[0]
+    current_team = None
+    if pick.get("id"):
+        try:
+            raw = await _get("/players/squads", {"player": pick["id"]}, "squads")
+            pack = _squad_pack(raw, 0) if raw else {}
+            if pack.get("team"):
+                current_team = {"team_id": pack.get("team_id"), "team": pack.get("team")}
+        except FootballDataError:
+            current_team = None
+    return {
+        "query": query,
+        "at_team": True if current_team else None,
+        "player": pick,
+        "current_team": current_team,
+        "other_matches": [c for c in candidates if c is not pick][:4],
+        "note": None if current_team else "Am găsit jucătorul, dar lotul curent nu e publicat.",
+    }
 
 
 async def get_standings(league_id: int, season: int) -> list[dict]:

@@ -202,6 +202,33 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "get_team_squad",
+        "description": ("Lotul ACTUAL al unei echipe (nume, pozitie, numar). "
+                        "Foloseste-l cand vorbesti despre cine joaca la club ACUM. "
+                        "Nu inventa jucatori din memorie."),
+        "input_schema": {
+            "type": "object",
+            "properties": {"team_id": {"type": "integer"}},
+            "required": ["team_id"],
+        },
+    },
+    {
+        "name": "lookup_player",
+        "description": ("Verifica daca un jucator e ACUM la o echipa. "
+                        "Cu team_id: da/nu pe lotul acelei echipe (si plecari recente). "
+                        "Fara team_id: cauta jucatorul si intoarce clubul curent. "
+                        "OBLIGATORIU cand userul intreaba de un jucator — nu raspunde din memorie."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "numele jucatorului, ex. 'Haaland'"},
+                "team_id": {"type": "integer",
+                            "description": "optional — daca userul intreaba de o echipa anume"},
+            },
+            "required": ["name"],
+        },
+    },
+    {
         "name": "get_standings",
         "description": "Clasamentul unei ligi: pozitie, puncte, golaveraj, forma.",
         "input_schema": {
@@ -357,6 +384,8 @@ STATUS_LABELS = {
     "get_team_statistics": "Iau statisticile de sezon: goluri, formă acasă/deplasare…",
     "get_h2h": "Compar întâlnirile directe dintre cele două echipe…",
     "get_injuries": "Verific cine lipsește: accidentări și suspendări…",
+    "get_team_squad": "Iau lotul actual al echipei…",
+    "lookup_player": "Verific la ce club joacă jucătorul…",
     "get_standings": "Consult clasamentul — loc, puncte, formă recentă…",
     "get_odds": "Citesc cotele: rezultat, goluri, ambele marchează, șansă dublă…",
     "build_ticket": "Compun biletul din variantele strânse — mix de piețe și cota țintă…",
@@ -451,6 +480,18 @@ async def status_label(name: str, args: Optional[dict] = None,
         team = await _team_label(args.get("team_id"))
         who = f" la {team}" if team else ""
         return f"Verific cine lipsește{who}{progress}: accidentări și suspendări."
+
+    if name == "get_team_squad":
+        team = await _team_label(args.get("team_id"))
+        who = f" la {team}" if team else ""
+        return f"Iau lotul actual{who}{progress} — cine e acum la club."
+
+    if name == "lookup_player":
+        q = (args.get("name") or "").strip()
+        team = await _team_label(args.get("team_id"))
+        who = f" la {team}" if team else ""
+        whom = f" pe „{q}”" if q else ""
+        return f"Verific{whom}{who}{progress} — dacă joacă acum la club."
 
     if name == "get_h2h":
         a = await _team_label(args.get("team1_id") or args.get("team_id"))
@@ -548,6 +589,16 @@ async def _batch_status(name: str, blocks: list) -> str:
         listed = _join_ro(names)
         extra = f" la {listed}" if listed else ""
         return f"Verific cine lipsește{extra}: accidentări și suspendări."
+    if name == "get_team_squad":
+        names = [await _team_label((b.input or {}).get("team_id")) for b in blocks]
+        listed = _join_ro(names)
+        extra = f" la {listed}" if listed else ""
+        return f"Iau lotul actual{extra}."
+    if name == "lookup_player":
+        qs = [(b.input or {}).get("name") or "" for b in blocks]
+        listed = _join_ro([q for q in qs if q])
+        extra = f" pe {listed}" if listed else ""
+        return f"Verific la ce club joacă{extra}."
     if name == "get_team_statistics":
         names = [await _team_label((b.input or {}).get("team_id")) for b in blocks]
         listed = _join_ro(names)
@@ -631,6 +682,10 @@ async def _execute_tool(name: str, args: dict[str, Any],
             return await fd.get_h2h(args["team1_id"], args["team2_id"], args.get("last", 6))
         if name == "get_injuries":
             return await fd.get_injuries(args["team_id"], args["season"])
+        if name == "get_team_squad":
+            return await fd.get_team_squad(args["team_id"])
+        if name == "lookup_player":
+            return await fd.lookup_player(args["name"], args.get("team_id"))
         if name == "get_standings":
             return await fd.get_standings(args["league_id"], args["season"])
         if name == "get_odds":

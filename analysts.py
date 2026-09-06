@@ -627,6 +627,35 @@ async def prefetch_league_packs(fixture_ids: list[int]) -> dict:
     return packs
 
 
+async def prefetch_team_rosters(fixture_ids: list[int]) -> None:
+    """Lot + transferuri recente, o dată per echipă din shortlist (cache TTL)."""
+    team_ids: set[int] = set()
+    for fid in fixture_ids:
+        fx = await db.get_fixture(fid)
+        if not fx:
+            continue
+        for key in ("home_id", "away_id"):
+            try:
+                team_ids.add(int(fx[key]))
+            except (KeyError, TypeError, ValueError):
+                continue
+    if not team_ids:
+        return
+
+    async def one(tid: int) -> None:
+        try:
+            await fd.get_team_squad(tid)
+        except Exception:
+            pass
+        try:
+            await fd.get_team_transfers(tid)
+        except Exception:
+            pass
+
+    await asyncio.gather(*[one(tid) for tid in team_ids])
+    log.info("Prefetch loturi: %d echipe (/players/squads + /transfers)", len(team_ids))
+
+
 async def assemble_data_pack(fixture_id: int, league_packs: Optional[dict] = None) -> dict:
     """
     Aduna TOATE datele pentru un meci (fixture store + API-Football prin
@@ -694,20 +723,35 @@ async def assemble_data_pack(fixture_id: int, league_packs: Optional[dict] = Non
         safe("away_season_stats", fd.get_team_statistics(away_id, league_id, season)),
         safe("h2h", fd.get_h2h(home_id, away_id, 6)),
         safe("predictions", fd.get_predictions(fixture_id)),
+        safe("home_squad", fd.get_team_squad(home_id)),
+        safe("away_squad", fd.get_team_squad(away_id)),
+        safe("home_transfers", fd.get_team_transfers(home_id)),
+        safe("away_transfers", fd.get_team_transfers(away_id)),
     ]
+    want_lineups = fd._kickoff_within_hours(fx.get("kickoff_iso"), 36)
+    if want_lineups:
+        rest.append(safe("lineups", fd.get_lineups(fixture_id)))
     if shared is None:
-        (home_last, away_last, home_stats, away_stats, home_inj, away_inj,
-         h2h, standings, predictions) = await asyncio.gather(
+        fetched = await asyncio.gather(
             rest[0], rest[1], rest[2], rest[3],
             safe("home_injuries", fd.get_injuries(home_id, season)),
             safe("away_injuries", fd.get_injuries(away_id, season)),
             rest[4],
             safe("standings", fd.get_standings(league_id, season)),
             rest[5],
+            rest[6], rest[7], rest[8], rest[9],
+            *([rest[10]] if want_lineups else []),
         )
+        (home_last, away_last, home_stats, away_stats, home_inj, away_inj,
+         h2h, standings, predictions,
+         home_squad, away_squad, home_xfers, away_xfers) = fetched[:13]
+        lineups = fetched[13] if want_lineups else {"published": False}
     else:
+        fetched = await asyncio.gather(*rest)
         (home_last, away_last, home_stats, away_stats,
-         h2h, predictions) = await asyncio.gather(*rest)
+         h2h, predictions,
+         home_squad, away_squad, home_xfers, away_xfers) = fetched[:10]
+        lineups = fetched[10] if want_lineups else {"published": False}
 
     def _row(team_id: int) -> Optional[dict]:
         if not standings:
@@ -754,6 +798,8 @@ async def assemble_data_pack(fixture_id: int, league_packs: Optional[dict] = Non
             "name": fx["home_name"],
             "last_matches": home_last,
             "season_stats": home_stats,
+            "squad": home_squad,
+            "recent_transfers": home_xfers,
             "injuries": home_inj,
             "standings_row": _row(home_id),
             "days_since_last_match": home_rest,
@@ -764,6 +810,8 @@ async def assemble_data_pack(fixture_id: int, league_packs: Optional[dict] = Non
             "name": fx["away_name"],
             "last_matches": away_last,
             "season_stats": away_stats,
+            "squad": away_squad,
+            "recent_transfers": away_xfers,
             "injuries": away_inj,
             "standings_row": _row(away_id),
             "days_since_last_match": away_rest,
@@ -772,6 +820,7 @@ async def assemble_data_pack(fixture_id: int, league_packs: Optional[dict] = Non
         "h2h": h2h,
         "odds": odds,
         "predictions": predictions,
+        "lineups": lineups,
         "data_gaps": gaps,
     }
 
@@ -780,7 +829,7 @@ async def assemble_data_pack(fixture_id: int, league_packs: Optional[dict] = Non
 # Apelul LLM al analistului
 # ---------------------------------------------------------------------------
 
-_ANALYST_SYSTEM_PROMPT = """You are a football match analyst. You receive ONE match as a JSON data pack (fixture info, both teams' recent matches, season stats, injuries, H2H, standings, bookmaker odds, API-Football predictions, computed rest-days and midweek-European-game flags, and data_gaps).
+_ANALYST_SYSTEM_PROMPT = """You are a football match analyst. You receive ONE match as a JSON data pack (fixture info, both teams' recent matches, season stats, CURRENT squad, recent transfers in/out, injuries, optional confirmed lineups, H2H, standings, bookmaker odds, API-Football predictions, computed rest-days and midweek-European-game flags, and data_gaps).
 
 Output ONLY a single valid JSON object — no prose, no markdown fences — with this schema:
 {"fixture_id":int,"match":str,"kickoff":"YYYY-MM-DDTHH:MM",
@@ -798,8 +847,9 @@ RULES:
 - best_candidates: 2-4 selections, ONLY for markets whose real odds appear in the pack (use reference_odd or avg_odd from the pack — never invent). No odds in pack => fewer or zero candidates.
 - MARKET FAMILIES: when the pack has at least 3 distinct families (result, goals, btts, double_chance, handicap, team-based, half-time), propose candidates from at least 3 of them. Safe-but-boring markets (double chance, over 1.5, team to score) are first-class options — not leftovers.
 - Pick the market where your statistical EDGE over the implied probability (prob − 1/avg_odd) is largest AND best justified by the data — not the market with the highest odds.
-- Every candidate's reason MUST name the concrete data points that CREATE the edge: scores, goal averages, named absentees, rest days, H2H dates. "E favorită" is not a reason.
-- top_factors: max 5; EACH should contain a number, score, date, named player, OR a pack-grounded schedule fact (midweek European game, rest days). Vague quality claims are dropped one-by-one — they do not fail the whole analysis.
+- Every candidate's reason MUST name the concrete data points that CREATE the edge: scores, goal averages, named absentees (ONLY if listed in injuries or missing from a published lineup), rest days, H2H dates. "E favorită" is not a reason.
+- PLAYERS (non-negotiable): name a player ONLY if that exact person appears in home/away.squad.players, home/away.injuries, home/away.recent_transfers, or lineups.startxi/bench. If the name is not in the pack, do not mention them — not from memory, not "usually plays", not last season's star. Prefer numbers (goals, form, rest) over inventing personnel.
+- top_factors: max 5; EACH should contain a number, score, date, a pack-listed player, OR a pack-grounded schedule fact (midweek European game, rest days). Vague quality claims are dropped one-by-one — they do not fail the whole analysis.
 - BANNED generic phrases (never use, in any language): "echipă de calitate", "echipă superioară/consacrată", "formă bună" without numbers, "meci deschis", "tradițional cu goluri", "meci de tempo ridicat", "outsider clar" without the odds, "favorită clară" without numbers. If a claim cannot be grounded in pack data, DROP it.
 - angle: ONE non-obvious connection grounded in pack data: schedule congestion (days_since_last_match), midweek European game, stakes/table context, promoted side, key absence chain. One or two sentences, in Romanian.
 - The API-Football predictions block is one signal among many — never copy it as your conclusion.
@@ -1148,10 +1198,13 @@ async def analyze_matches_events(fixture_ids: list[int], max_matches: int = 15,
         yield ("result", {"error": "Niciun fixture_id de analizat."})
         return
 
-    yield ("status", "Iau clasamentele și accidentările din ligile meciurilor…")
+    yield ("status", "Iau clasamentele, loturile și accidentările din ligile meciurilor…")
     if op.enabled():
         asyncio.create_task(op.prefetch_for_fixtures(ids))
-    packs = await prefetch_league_packs(ids)
+    packs, _ = await asyncio.gather(
+        prefetch_league_packs(ids),
+        prefetch_team_rosters(ids),
+    )
     token = _league_packs.set(packs)
     sem = asyncio.Semaphore(max_parallel_analysts())
     timeout = analyst_timeout_seconds()

@@ -322,8 +322,8 @@ async def test_e2e_ticket_flow_streams_parallel_status(no_http, monkeypatch):
 _CLASSIC_TOOLS = {
     "get_fixtures", "get_fixture_changes", "track_league", "list_leagues",
     "get_team_last_matches", "get_team_statistics", "get_h2h",
-    "get_injuries", "get_standings", "get_odds", "build_ticket",
-    "get_my_tickets",
+    "get_injuries", "get_team_squad", "lookup_player", "get_standings",
+    "get_odds", "build_ticket", "get_my_tickets",
 }
 
 
