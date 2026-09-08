@@ -206,8 +206,9 @@ TOOLS: list[dict] = [
     },
     {
         "name": "get_team_squad",
-        "description": ("Lotul ACTUAL al unei echipe (nume, pozitie, numar). "
+        "description": ("Lotul ACTUAL al unei echipe (nume, varsta, pozitie — fara numar de tricou). "
                         "Foloseste-l cand vorbesti despre cine joaca la club ACUM. "
+                        "Listeaza doar nume si varsta; nu afisa si nu inventa numere de tricou. "
                         "Nu inventa jucatori din memorie."),
         "input_schema": {
             "type": "object",

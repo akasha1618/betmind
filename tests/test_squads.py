@@ -32,7 +32,10 @@ def test_squad_pack_from_api_shape():
     assert pack["team"] == "Manchester City"
     assert pack["players"][1]["name"] == "Erling Haaland"
     assert pack["players"][1]["pos"] == "A"
+    assert pack["players"][1]["age"] == 25
     assert pack["players"][0]["pos"] == "G"
+    assert "no" not in pack["players"][0]
+    assert "no" not in pack["players"][1]
 
 
 def test_is_reserve_side_matches_academy_suffixes_not_other_clubs():
@@ -212,6 +215,7 @@ def test_prompts_forbid_naming_players_from_memory():
     assert "lookup_player" in p
     assert "get_team_squad" in p
     assert "PLAYERS" in p
+    assert "shirt numbers" in p
     assert "by_league" in p
     a = analysts._ANALYST_SYSTEM_PROMPT
     assert "squad.players" not in a

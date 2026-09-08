@@ -1356,7 +1356,6 @@ def _squad_pack(raw: Any, team_id: int) -> dict:
             "id": p.get("id"),
             "name": name,
             "pos": _pos_short(p.get("position")),
-            "no": p.get("number"),
             "age": p.get("age"),
         })
     return {
