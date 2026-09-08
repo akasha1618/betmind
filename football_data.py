@@ -884,6 +884,12 @@ async def get_fixtures(date_from: str, date_to: Optional[str] = None,
         if f["date"] in matches_per_day:
             matches_per_day[f["date"]] += 1
 
+    by_league: dict[str, int] = {}
+    for f in out:
+        label = f"{f.get('league') or 'necunoscută'} (id {f.get('league_id')})"
+        by_league[label] = by_league.get(label, 0) + 1
+    by_league = dict(sorted(by_league.items(), key=lambda kv: (-kv[1], kv[0])))
+
     if sources == {"local_db"}:
         source = "local_db"
     elif sources == {"live_api"}:
@@ -891,17 +897,27 @@ async def get_fixtures(date_from: str, date_to: Optional[str] = None,
     else:
         source = "mixed"
 
+    listed = out[:120]
     result = {
         "count": len(out),
+        "listed": len(listed),
+        "by_league": by_league,
         "source": source,
         "timezone": app_timezone_name(),
         "matches_per_day": matches_per_day,
         "days": day_meta,
-        "fixtures": out[:120],
+        "fixtures": listed,
         "note": ("Toate datele si orele sunt LOCALE Romania (APP_TIMEZONE) — nu le converti. "
-                 "status_group: upcoming=recomandabil, live/finished/other=nu recomanda."),
+                 "status_group: upcoming=recomandabil, live/finished/other=nu recomanda. "
+                 "count și by_league acoperă TOATE meciurile; nu raporta count-ul total "
+                 "ca fiind o singură competiție. Dacă userul a cerut o ligă, recheamă cu league_ids."),
         "api_requests_remaining_today": requests_remaining(),
     }
+    if len(out) > len(listed):
+        result["truncated"] = True
+        result["note"] += (f" Lista e tăiată la {len(listed)} din {len(out)}. "
+                           "Pentru o competiție anume, recheamă cu league_ids "
+                           "(Champions League = 2, Europa League = 3, Conference = 848).")
     if budget_exhausted:
         result["budget_exhausted"] = True
         result["note"] += (" ATENTIE: bugetul API de azi e epuizat; datele vin din baza locala "

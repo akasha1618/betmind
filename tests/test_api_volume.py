@@ -144,10 +144,10 @@ async def test_eight_match_ticket_call_volume(fake_http, monkeypatch):
     assert by_ep["/fixtures/headtohead"] == 8
     assert by_ep["/odds"] == 8
     assert by_ep["/predictions"] == 8
-    assert by_ep["/players/squads"] == 16
+    assert "/players/squads" not in by_ep
     assert by_ep["/transfers"] == 16
     assert by_ep["/fixtures/lineups"] == 8  # kickoff e azi → în fereastra de 36h
     total = sum(by_ep.values())
-    assert total == 104, f"apeluri pe endpoint: {dict(by_ep)}"
+    assert total == 88, f"apeluri pe endpoint: {dict(by_ep)}"
     # Niciun injuries pe echipa.
     assert all("team" not in p for e, p in fake_http.calls if e == "/injuries")

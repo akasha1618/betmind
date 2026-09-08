@@ -97,7 +97,7 @@ async def test_lookup_player_on_squad_and_departed(fake_http, monkeypatch):
     assert "Nu e în lotul actual" in missing["note"]
 
 
-async def test_assemble_pack_includes_squad(fake_http):
+async def test_assemble_pack_includes_transfers_not_full_squad(fake_http):
     import db
     from tests.conftest import raw_fixture
     from tests.test_v1b import _now_iso, _today
@@ -109,15 +109,13 @@ async def test_assemble_pack_includes_squad(fake_http):
         home=(50, "City"), away=(33, "United"),
     ))
     await db.upsert_fixture(parsed, _now_iso())
-    fake_http.response_payload = [{
-        "team": {"id": 50, "name": "City"},
-        "players": [{"id": 1, "name": "Ederson", "position": "Goalkeeper", "number": 31}],
-    }]
     pack = await analysts.assemble_data_pack(501)
-    assert "squad" in pack["home"]
+    assert "squad" not in pack["home"]
+    assert "squad" not in pack["away"]
     assert "recent_transfers" in pack["home"]
     assert "lineups" in pack
-    assert any(e == "/players/squads" for e, _ in fake_http.calls)
+    assert not any(e == "/players/squads" for e, _ in fake_http.calls)
+    assert any(e == "/transfers" for e, _ in fake_http.calls)
 
 
 def test_prompts_forbid_naming_players_from_memory():
@@ -125,8 +123,10 @@ def test_prompts_forbid_naming_players_from_memory():
     assert "lookup_player" in p
     assert "get_team_squad" in p
     assert "PLAYERS" in p
+    assert "by_league" in p
     a = analysts._ANALYST_SYSTEM_PROMPT
-    assert "squad.players" in a
+    assert "squad.players" not in a
+    assert "recent_transfers" in a
     assert "do not mention them" in a.lower() or "If the name is not in the pack" in a
 
 

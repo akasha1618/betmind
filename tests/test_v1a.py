@@ -100,12 +100,40 @@ async def test_in_window_get_fixtures_zero_http(no_http):
     assert res["days"][day]["last_synced_at"] is not None
     assert res["days"][day]["stale"] is False
     assert res["matches_per_day"] == {day: 1}
+    assert res["listed"] == 1
+    assert any("id " in k for k in res["by_league"])
 
     f = res["fixtures"][0]
     assert f["date"] == day
     assert f["time"] == "19:30"
     assert f["status_group"] == "upcoming"
     assert f["home"]["name"] == "NEC"
+
+
+async def test_get_fixtures_by_league_does_not_hide_other_competitions():
+    """Unfiltered count mixes leagues; by_league keeps UCL distinct from PL."""
+    await db.init_db()
+    day = _today()
+    pl = _parsed(fixture_id=1, league_id=39, kickoff=f"{day}T16:00:00+03:00")
+    ucl = fd._parse_fixture(raw_fixture(
+        fixture_id=2, league_id=2, kickoff=f"{day}T22:00:00+03:00",
+        home=(541, "Madrid"), away=(505, "Inter"),
+    ))
+    ucl["league_name"] = "UEFA Champions League"
+    await db.upsert_fixture(pl, _now_iso())
+    await db.upsert_fixture(ucl, _now_iso())
+    await db.mark_day_synced(day, _now_iso())
+
+    all_fx = await fd.get_fixtures(day)
+    assert all_fx["count"] == 2
+    assert all_fx["listed"] == 2
+    assert sum(all_fx["by_league"].values()) == 2
+    assert any("id 2" in k for k in all_fx["by_league"])
+    assert any("id 39" in k for k in all_fx["by_league"])
+
+    only_ucl = await fd.get_fixtures(day, league_ids=[2])
+    assert only_ucl["count"] == 1
+    assert only_ucl["fixtures"][0]["home"]["name"] == "Madrid"
 
 
 async def test_unsynced_day_goes_live_then_serves_from_db(fake_http):
