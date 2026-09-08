@@ -229,6 +229,55 @@ async def test_sync_day_detects_postponement_and_filters_untracked(fake_http):
     assert report["changes"][0]["meaning"] == "postponed (amanat)"
 
 
+async def test_sync_prunes_stale_ucl_placeholders_off_that_day(fake_http):
+    """Rundele viitoare rămase cu data de azi trebuie scoase la sync."""
+    await db.init_db()
+    day = _today()
+    ghost = _parsed(
+        fixture_id=1635626, league_id=2,
+        kickoff=f"{day}T22:00:00+03:00",
+        home=(529, "Barcelona"), away=(50, "Man City"),
+    )
+    await db.upsert_fixture(ghost, _now_iso())
+    fake_http.response_payload = [
+        raw_fixture(
+            fixture_id=1635714, league_id=2,
+            kickoff=f"{day}T22:00:00+03:00",
+            home=(541, "Real Madrid"), away=(505, "Inter"),
+        ),
+    ]
+    await sync.sync_day(day)
+    rows = await db.get_fixtures_for_days([day], [2])
+    assert {r["fixture_id"] for r in rows} == {1635714}
+
+
+async def test_get_fixtures_live_refreshes_bloated_league_day(fake_http):
+    await db.init_db()
+    day = _today()
+    for i in range(21):
+        await db.upsert_fixture(_parsed(
+            fixture_id=2000 + i, league_id=2,
+            kickoff=f"{day}T22:00:00+03:00",
+            home=(10 + i, f"Home{i}"), away=(80 + i, f"Away{i}"),
+        ), _now_iso())
+    await db.mark_day_synced(day, _now_iso())
+    fake_http.response_payload = [
+        raw_fixture(
+            fixture_id=2000, league_id=2,
+            kickoff=f"{day}T19:45:00+03:00",
+            home=(10, "Home0"), away=(80, "Away0"),
+        ),
+        raw_fixture(
+            fixture_id=2001, league_id=2,
+            kickoff=f"{day}T22:00:00+03:00",
+            home=(11, "Home1"), away=(81, "Away1"),
+        ),
+    ]
+    res = await fd.get_fixtures(day, league_ids=[2])
+    assert res["count"] == 2
+    assert {f["fixture_id"] for f in res["fixtures"]} == {2000, 2001}
+
+
 async def test_run_sync_cycle_syncs_window_and_logs(fake_http):
     await db.init_db()
     fake_http.response_payload = []

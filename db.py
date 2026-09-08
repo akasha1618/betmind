@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS fixtures(
     away_name      TEXT,
     goals_home     INTEGER,
     goals_away     INTEGER,
+    round          TEXT,
     last_synced_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_fixtures_date ON fixtures(date_local);
@@ -208,6 +209,9 @@ _MIGRATIONS: dict[str, list[str]] = {
     "messages": [
         "ALTER TABLE messages ADD COLUMN turn_id TEXT",
     ],
+    "fixtures": [
+        "ALTER TABLE fixtures ADD COLUMN round TEXT",
+    ],
 }
 
 # Campurile pe care le urmarim pentru amanari/reprogramari.
@@ -334,11 +338,11 @@ async def upsert_fixture(fx: dict[str, Any], synced_at: str) -> list[tuple[str, 
             INSERT INTO fixtures(fixture_id, league_id, league_name, season,
                                  date_local, time_local, kickoff_iso, status, status_group,
                                  home_id, home_name, away_id, away_name,
-                                 goals_home, goals_away, last_synced_at)
+                                 goals_home, goals_away, round, last_synced_at)
             VALUES(:fixture_id, :league_id, :league_name, :season,
                    :date_local, :time_local, :kickoff_iso, :status, :status_group,
                    :home_id, :home_name, :away_id, :away_name,
-                   :goals_home, :goals_away, :last_synced_at)
+                   :goals_home, :goals_away, :round, :last_synced_at)
             ON CONFLICT(fixture_id) DO UPDATE SET
                 league_id=excluded.league_id, league_name=excluded.league_name,
                 season=excluded.season, date_local=excluded.date_local,
@@ -347,9 +351,10 @@ async def upsert_fixture(fx: dict[str, Any], synced_at: str) -> list[tuple[str, 
                 home_id=excluded.home_id, home_name=excluded.home_name,
                 away_id=excluded.away_id, away_name=excluded.away_name,
                 goals_home=excluded.goals_home, goals_away=excluded.goals_away,
+                round=excluded.round,
                 last_synced_at=excluded.last_synced_at
             """,
-            {**fx, "last_synced_at": synced_at},
+            {**fx, "round": fx.get("round"), "last_synced_at": synced_at},
         )
         await conn.commit()
         return changes
@@ -373,6 +378,39 @@ async def get_fixtures_for_days(days: list[str],
         query += " ORDER BY kickoff_iso"
         cur = await conn.execute(query, params)
         return [dict(r) for r in await cur.fetchall()]
+    finally:
+        await conn.close()
+
+
+# Peste atât de multe meciuri într-o ligă, într-o singură zi, e aproape sigur
+# gunoi rămas din rundele viitoare (UCL league stage ~9–18/zi, nu 130).
+MAX_FIXTURES_PER_LEAGUE_PER_DAY = 20
+
+
+async def prune_stale_fixtures_on_day(day: str, keep_ids: list[int],
+                                      league_ids: list[int]) -> int:
+    """Șterge meciurile din ligile urmărite care încă au date_local=day, dar
+    nu au venit în răspunsul API al zilei (dată mutată / placeholder vechi)."""
+    if not league_ids:
+        return 0
+    keep = {int(i) for i in keep_ids if i is not None}
+    conn = await _connect()
+    try:
+        placeholders = ",".join("?" * len(league_ids))
+        params: list[Any] = [day, *league_ids]
+        if keep:
+            keep_ph = ",".join("?" * len(keep))
+            sql = (f"DELETE FROM fixtures WHERE date_local = ? "
+                   f"AND league_id IN ({placeholders}) "
+                   f"AND fixture_id NOT IN ({keep_ph})")
+            params.extend(sorted(keep))
+        else:
+            sql = (f"DELETE FROM fixtures WHERE date_local = ? "
+                   f"AND league_id IN ({placeholders})")
+        cur = await conn.execute(sql, params)
+        await conn.commit()
+        n = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
+        return int(n)
     finally:
         await conn.close()
 

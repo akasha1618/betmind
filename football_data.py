@@ -24,7 +24,7 @@ import os
 import re
 import time
 import unicodedata
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
@@ -712,6 +712,7 @@ def _parse_fixture(f: dict) -> dict:
         "league_id": league.get("id"),
         "league_name": league_name,
         "season": league.get("season"),
+        "round": (league.get("round") or "").strip() or None,
         "date_local": kickoff[:10],
         "time_local": kickoff[11:16],
         "kickoff_iso": kickoff,
@@ -751,10 +752,50 @@ def _fixture_out(p: dict) -> dict:
         "league": p["league_name"],
         "league_id": p["league_id"],
         "season": p["season"],
+        "round": p.get("round"),
         "home": {"id": p["home_id"], "name": p["home_name"]},
         "away": {"id": p["away_id"], "name": p["away_name"]},
         "score": f"{gh}-{ga}" if gh is not None and ga is not None else None,
     }
+
+
+async def ingest_day(day: str, parsed: list[dict]) -> int:
+    """Upsert ligile urmărite + șterge meciurile rămase pe ziua asta fără
+    să mai apară în răspunsul API (rundele viitoare cu dată greșită)."""
+    tracked = await db.get_tracked_leagues()
+    synced_at = now_local().isoformat(timespec="seconds")
+    keep_ids: list[int] = []
+    n_changes = 0
+    for p in parsed:
+        lid = p.get("league_id")
+        if lid not in tracked:
+            continue
+        fid = p.get("fixture_id")
+        if fid is not None:
+            keep_ids.append(int(fid))
+        changes = await db.upsert_fixture(p, synced_at)
+        for field, old, new in changes:
+            log.info("Fixture change %s (%s–%s): %s %s -> %s",
+                     p["fixture_id"], p["home_name"], p["away_name"], field, old, new)
+        n_changes += len(changes)
+    # 20 meciuri = dimensiunea clasică de pagină API-Football; nu prune-uim
+    # ca să nu ștergem meciuri reale dacă am primit doar prima pagină.
+    if len(parsed) == 20:
+        log.warning("Nu prunez ziua %s: răspunsul are exact 20 de meciuri "
+                    "(posibil pagină incompletă)", day)
+    else:
+        removed = await db.prune_stale_fixtures_on_day(
+            day, keep_ids, list(tracked.keys()))
+        if removed:
+            log.info("Prune %s: %d meciuri vechi scoase de pe zi (nu mai sunt în API)",
+                     day, removed)
+    await db.mark_day_synced(day, synced_at)
+    return n_changes
+
+
+def _league_day_is_bloated(rows: list[dict]) -> bool:
+    counts = Counter(r.get("league_id") for r in rows)
+    return any(n > db.MAX_FIXTURES_PER_LEAGUE_PER_DAY for n in counts.values())
 
 
 async def fetch_day(day: str) -> list[dict]:
@@ -844,6 +885,34 @@ async def get_fixtures(date_from: str, date_to: Optional[str] = None,
 
         if in_window and db_can_serve and synced_at:
             rows = await db.get_fixtures_for_days([day_str], sorted(wanted))
+            if _league_day_is_bloated(rows):
+                log.warning("Ziua %s are prea multe meciuri per ligă în store — "
+                            "re-sincronizez din API (posibil rundă UCL întreagă cu dată greșită)",
+                            day_str)
+                try:
+                    parsed = await fetch_day(day_str)
+                    await ingest_day(day_str, parsed)
+                    rows = await db.get_fixtures_for_days([day_str], sorted(wanted))
+                    day_meta[day_str] = {
+                        "source": "live_api",
+                        "last_synced_at": now_local().isoformat(timespec="seconds"),
+                        "stale": False,
+                        "pruned": True,
+                    }
+                    sources.add("live_api")
+                    fixtures.extend(rows)
+                    continue
+                except BudgetExhausted as e:
+                    budget_exhausted = True
+                    day_meta[day_str] = {
+                        "source": "local_db",
+                        "last_synced_at": synced_at,
+                        "stale": True,
+                        "note": str(e),
+                    }
+                    sources.add("local_db")
+                    fixtures.extend(rows)
+                    continue
             fixtures.extend(rows)
             age_min = _staleness_minutes(synced_at)
             day_meta[day_str] = {
@@ -856,13 +925,10 @@ async def get_fixtures(date_from: str, date_to: Optional[str] = None,
 
         try:
             parsed = await fetch_day(day_str)
-            synced_now = now_local().isoformat(timespec="seconds")
-            for p in parsed:
-                if p["league_id"] in tracked:
-                    await db.upsert_fixture(p, synced_now)
-            await db.mark_day_synced(day_str, synced_now)
-            fixtures.extend(p for p in parsed if p["league_id"] in wanted)
-            day_meta[day_str] = {"source": "live_api", "last_synced_at": synced_now, "stale": False}
+            await ingest_day(day_str, parsed)
+            rows = await db.get_fixtures_for_days([day_str], sorted(wanted))
+            fixtures.extend(rows)
+            day_meta[day_str] = {"source": "live_api", "last_synced_at": now_local().isoformat(timespec="seconds"), "stale": False}
             sources.add("live_api")
         except BudgetExhausted as e:
             budget_exhausted = True

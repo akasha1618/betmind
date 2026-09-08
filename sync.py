@@ -80,20 +80,7 @@ async def sync_day(day: str) -> int:
     Ridica BudgetExhausted / FootballDataError mai departe.
     """
     parsed = await fd.fetch_day(day)
-    tracked = await db.get_tracked_leagues()
-    synced_at = fd.now_local().isoformat(timespec="seconds")
-
-    n_changes = 0
-    for p in parsed:
-        if p["league_id"] not in tracked:
-            continue
-        changes = await db.upsert_fixture(p, synced_at)
-        for field, old, new in changes:
-            log.info("Fixture change %s (%s–%s): %s %s -> %s",
-                     p["fixture_id"], p["home_name"], p["away_name"], field, old, new)
-        n_changes += len(changes)
-
-    await db.mark_day_synced(day, synced_at)
+    n_changes = await fd.ingest_day(day, parsed)
     return n_changes
 
 
