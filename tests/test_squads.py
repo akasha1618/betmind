@@ -55,22 +55,76 @@ def test_is_reserve_side_matches_academy_suffixes_not_other_clubs():
     assert not fd.is_reserve_side("Sporting CP", "Sporting Braga")
 
 
+def test_european_season_july_june():
+    assert fd.european_season(date(2026, 9, 8)) == 2026
+    assert fd.european_season(date(2027, 2, 1)) == 2026
+    assert fd.european_season(date(2026, 7, 1)) == 2026
+    assert fd.european_season(date(2026, 6, 30)) == 2025
+
+
+def test_select_first_team_keeps_injured_and_apps_drops_academy_only():
+    """Criteriu vs lot oficial RM 2026/27 (realmadrid.com, 10.08.2026)."""
+    players = [
+        {"id": 730, "name": "T. Courtois", "age": 33, "pos": "G"},
+        {"id": 568427, "name": "I. Voloshyn", "age": 19, "pos": "G"},
+        {"id": 341640, "name": "Raúl Asencio", "age": 22, "pos": "D"},
+        {"id": 284300, "name": "Álvaro Fernández", "age": 23, "pos": "D"},
+        {"id": 330436, "name": "David Jiménez", "age": 21, "pos": "D"},
+        {"id": 443595, "name": "Jesús Fortea", "age": 18, "pos": "D"},
+        {"id": 313167, "name": "Manuel Ángel", "age": 21, "pos": "M"},
+        {"id": 509470, "name": "Thiago Pitarch", "age": 18, "pos": "M"},
+        {"id": 377122, "name": "Endrick", "age": 19, "pos": "A"},
+        {"id": 386872, "name": "Sergio Mestre", "age": 20, "pos": "G"},
+    ]
+    appearances = {730: 4, 284300: 2}
+    injured = {341640, 509470, 377122}
+    reserve = {443595, 386872}
+    kept = {p["name"] for p in fd.select_first_team_players(
+        players, appearances, injured, reserve)}
+    assert kept == {
+        "T. Courtois", "Raúl Asencio", "Álvaro Fernández",
+        "Thiago Pitarch", "Endrick",
+    }
+    assert "I. Voloshyn" not in kept
+    assert "David Jiménez" not in kept
+    assert "Manuel Ángel" not in kept
+    assert "Jesús Fortea" not in kept
+    assert "Sergio Mestre" not in kept
+
+
 async def test_get_team_squad_strips_players_also_on_reserve_team(fake_http):
-    """API amestecă Castilla în lotul 541; scoatem id-urile de pe Real Madrid II."""
+    """API amestecă Castilla în lotul 541; scoatem id-urile de pe Real Madrid II
+    doar dacă n-au jucat / nu sunt accidentați la prima echipă."""
     fake_http.payload_for["/teams"] = [
         {"team": {"id": 541, "name": "Real Madrid"}},
         {"team": {"id": 9575, "name": "Real Madrid II"}},
         {"team": {"id": 22142, "name": "Real Madrid III"}},
         {"team": {"id": 9999, "name": "Real Madrid Women"}},
     ]
+    fake_http.payload_for["/players"] = [
+        {"player": {"id": 730, "name": "T. Courtois", "age": 33},
+         "statistics": [{"games": {"appearences": 4}}]},
+        {"player": {"id": 762, "name": "Vinícius Júnior", "age": 25},
+         "statistics": [{"games": {"appearences": 4}}]},
+    ]
+    fake_http.payload_for["/injuries"] = [
+        {"team": {"id": 541},
+         "player": {"id": 509470, "name": "Thiago Pitarch",
+                    "position": "Midfielder", "age": 18}},
+        {"team": {"id": 541},
+         "player": {"id": 10009, "name": "Rodrygo",
+                    "position": "Attacker", "age": 24}},
+    ]
     fake_http.squads_by_team = {
         541: [{
             "team": {"id": 541, "name": "Real Madrid"},
             "players": [
-                {"id": 730, "name": "T. Courtois", "number": 1, "position": "Goalkeeper"},
-                {"id": 762, "name": "Vinícius Júnior", "number": 7, "position": "Midfielder"},
-                {"id": 386872, "name": "Sergio Mestre", "number": 26, "position": "Goalkeeper"},
-                {"id": 443595, "name": "Jesús Fortea", "number": 2, "position": "Defender"},
+                {"id": 730, "name": "T. Courtois", "age": 33, "number": 1, "position": "Goalkeeper"},
+                {"id": 762, "name": "Vinícius Júnior", "age": 25, "number": 7, "position": "Midfielder"},
+                {"id": 386872, "name": "Sergio Mestre", "age": 20, "number": 26, "position": "Goalkeeper"},
+                {"id": 443595, "name": "Jesús Fortea", "age": 18, "number": 2, "position": "Defender"},
+                {"id": 568427, "name": "I. Voloshyn", "age": 19, "number": None, "position": "Goalkeeper"},
+                {"id": 509470, "name": "Thiago Pitarch", "age": 18, "number": 27, "position": "Midfielder"},
             ],
         }],
         9575: [{
@@ -78,6 +132,7 @@ async def test_get_team_squad_strips_players_also_on_reserve_team(fake_http):
             "players": [
                 {"id": 386872, "name": "Sergio Mestre", "number": 1, "position": "Goalkeeper"},
                 {"id": 443595, "name": "Jesús Fortea", "number": 2, "position": "Defender"},
+                {"id": 509470, "name": "Thiago Pitarch", "number": 16, "position": "Midfielder"},
             ],
         }],
         22142: [{
@@ -89,8 +144,8 @@ async def test_get_team_squad_strips_players_also_on_reserve_team(fake_http):
     }
     squad = await fd.get_team_squad(541)
     names = {p["name"] for p in squad["players"]}
-    assert names == {"T. Courtois", "Vinícius Júnior"}
-    assert squad["count"] == 2
+    assert names == {"T. Courtois", "Vinícius Júnior", "Thiago Pitarch", "Rodrygo"}
+    assert squad["count"] == 4
     squad_calls = [(e, p) for e, p in fake_http.calls if e == "/players/squads"]
     assert {"team": 541} in [p for _, p in squad_calls]
     assert {"team": 9575} in [p for _, p in squad_calls]

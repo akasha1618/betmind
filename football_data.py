@@ -69,6 +69,7 @@ TTL = {
     "transfers": 6 * 3600,
     "lineups": 15 * 60,
     "teams": 24 * 3600,
+    "players_season": 6 * 3600,
     "player_search": 12 * 3600,
 }
 
@@ -426,6 +427,12 @@ def now_local() -> datetime:
 
 def today_local() -> date:
     return now_local().date()
+
+
+def european_season(day: Optional[date] = None) -> int:
+    """Sezonul european (iulie–iunie): sept 2026 → 2026, feb 2027 → 2026."""
+    d = day or today_local()
+    return d.year if d.month >= 7 else d.year - 1
 
 
 def max_daily_requests() -> int:
@@ -1264,6 +1271,9 @@ _RESERVE_SUFFIX_RANK: dict[str, int] = {
     "3": 2,
 }
 _MAX_RESERVE_SQUADS = 3
+_FIRST_TEAM_SENIOR_AGE = 23
+_PLAYERS_SEASON_PAGE_SIZE = 20
+_PLAYERS_SEASON_MAX_PAGES = 5
 
 
 def _norm_team_name(value: Any) -> str:
@@ -1344,6 +1354,102 @@ async def _player_ids_on_squad(team_id: int) -> set[int]:
     return {p["id"] for p in pack.get("players") or [] if p.get("id") is not None}
 
 
+async def _season_appearances(team_id: int, season: int) -> dict[int, int]:
+    """Minute/meciuri de primă echipă în sezon. Paginat; eșec → dict gol."""
+    out: dict[int, int] = {}
+    try:
+        for page in range(1, _PLAYERS_SEASON_MAX_PAGES + 1):
+            params: dict = {"team": team_id, "season": season}
+            if page > 1:
+                params["page"] = page
+            raw = await _get("/players", params, "players_season")
+            if not raw:
+                break
+            for item in raw:
+                p = item.get("player") or {}
+                pid = p.get("id")
+                if pid is None:
+                    continue
+                stats = (item.get("statistics") or [{}])[0] or {}
+                games = stats.get("games") or {}
+                apps = games.get("appearences")
+                try:
+                    n = int(apps or 0)
+                except (TypeError, ValueError):
+                    n = 0
+                pid_i = int(pid)
+                out[pid_i] = max(out.get(pid_i, 0), n)
+            if len(raw) < _PLAYERS_SEASON_PAGE_SIZE:
+                break
+    except FootballDataError:
+        log.warning("squad %s: statistici sezon %s indisponibile", team_id, season)
+    return out
+
+
+async def _injured_player_map(team_id: int, season: int) -> dict[int, dict]:
+    """Jucători listați accidentați/suspendați la echipă în sezon (fără tăiere 30 zile)."""
+    out: dict[int, dict] = {}
+    try:
+        raw = await _get("/injuries", {"team": team_id, "season": season}, "injuries")
+    except FootballDataError:
+        log.warning("squad %s: accidentări sezon %s indisponibile", team_id, season)
+        return out
+    for item in raw or []:
+        item_team = ((item.get("team") or {}).get("id"))
+        if item_team is not None and item_team != team_id:
+            continue
+        p = item.get("player") or {}
+        pid, name = p.get("id"), (p.get("name") or "").strip()
+        if pid is None or not name:
+            continue
+        try:
+            pid_i = int(pid)
+        except (TypeError, ValueError):
+            continue
+        out[pid_i] = {
+            "id": pid_i,
+            "name": name,
+            "pos": _pos_short(p.get("position")),
+            "age": p.get("age"),
+        }
+    return out
+
+
+def select_first_team_players(
+    players: list[dict],
+    appearances: dict[int, int],
+    injured_ids: set[int],
+    reserve_player_ids: set[int],
+    senior_age: int = _FIRST_TEAM_SENIOR_AGE,
+) -> list[dict]:
+    """Păstrează prima echipă: a jucat, e accidentat, sau e senior și nu e pe filială.
+
+    Juniorii doar pe lotul API (fără minute, fără injury) sunt academie contaminată.
+    Jucătorii de pe filială rămân dacă au apariții sau sunt pe lista de accidentați.
+    """
+    kept: list[dict] = []
+    for p in players:
+        pid = p.get("id")
+        if pid is None:
+            kept.append(p)
+            continue
+        try:
+            pid_i = int(pid)
+        except (TypeError, ValueError):
+            kept.append(p)
+            continue
+        apps = appearances.get(pid_i) or 0
+        if apps > 0 or pid_i in injured_ids:
+            kept.append(p)
+            continue
+        if pid_i in reserve_player_ids:
+            continue
+        age = p.get("age")
+        if age is None or int(age) >= senior_age:
+            kept.append(p)
+    return kept
+
+
 def _squad_pack(raw: Any, team_id: int) -> dict:
     item = raw[0] if isinstance(raw, list) and raw else (raw if isinstance(raw, dict) else {})
     team = item.get("team") or {}
@@ -1369,29 +1475,58 @@ def _squad_pack(raw: Any, team_id: int) -> dict:
 async def get_team_squad(team_id: int) -> dict:
     """Lotul curent al echipei (/players/squads). Sursa de adevăr: cine e ACUM.
 
-    API-Football amestecă adesea filialele (II/B/U21) în lotul primei echipe.
-    Scoatem jucătorii care apar și pe un lot de rezervă afiliat aceluiași club.
+    API-Football amestecă filialele în lotul primei echipe. Păstrăm jucătorul
+    dacă a avut apariții de primă echipă în sezon, e pe lista de accidentați
+    (inclusiv absenți lungi, care pot lipsi din /players/squads), sau e senior
+    și nu apare pe un lot de rezervă. Accidentații nu sunt excluși din lot.
     """
     raw = await _get("/players/squads", {"team": team_id}, "squads")
     if not raw:
         return {"team_id": team_id, "count": 0, "players": [],
                 "error": "Fără lot publicat pentru această echipă."}
     pack = _squad_pack(raw, team_id)
-    reserve_ids = await _affiliated_reserve_ids(team_id, pack.get("team"))
-    if not reserve_ids:
-        return pack
+    team_name = pack.get("team")
+    _, rank = _split_reserve_name(team_name or "")
+    reserve_ids = await _affiliated_reserve_ids(team_id, team_name)
     academy: set[int] = set()
     for rid in reserve_ids:
         academy |= await _player_ids_on_squad(rid)
-    if not academy:
+
+    if rank > 0:
+        if academy:
+            kept = [p for p in pack["players"] if p.get("id") not in academy]
+            dropped = pack["count"] - len(kept)
+            if dropped:
+                log.info("squad %s (%s): scos %s de pe filiala inferioară %s",
+                         team_id, team_name, dropped, reserve_ids)
+                pack["players"] = kept
+                pack["count"] = len(kept)
         return pack
-    kept = [p for p in pack["players"] if p.get("id") not in academy]
-    dropped = pack["count"] - len(kept)
-    if dropped:
-        log.info("squad %s (%s): scos %s jucători de filială (teams %s)",
-                 team_id, pack.get("team"), dropped, reserve_ids)
-        pack["players"] = kept
-        pack["count"] = len(kept)
+
+    season = european_season()
+    appearances = await _season_appearances(team_id, season)
+    injured = await _injured_player_map(team_id, season)
+    kept = select_first_team_players(
+        pack["players"], appearances, set(injured), academy)
+    have = {p.get("id") for p in kept if p.get("id") is not None}
+    added = 0
+    for pid, info in injured.items():
+        if pid in have:
+            continue
+        kept.append({
+            "id": info["id"],
+            "name": info["name"],
+            "pos": info.get("pos") or "?",
+            "age": info.get("age"),
+        })
+        have.add(pid)
+        added += 1
+    dropped = pack["count"] - (len(kept) - added)
+    if dropped or added:
+        log.info("squad %s (%s): filtru primă echipă scos=%s adăugat_accidentați=%s",
+                 team_id, team_name, dropped, added)
+    pack["players"] = kept
+    pack["count"] = len(kept)
     return pack
 
 
