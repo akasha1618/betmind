@@ -97,6 +97,7 @@ class FakeHTTP:
         self.response_payload: list[dict] = []
         self.payload_for: dict[str, list] = {}
         self.squads_by_team: dict[int, list] = {}
+        self.profiles_by_player: dict[int, list] = {}
         self.headers: dict[str, str] = {}
         # Pentru testele de diagnostic: status non-200 sau corp cu `errors`.
         self.status_code: int = 200
@@ -109,6 +110,14 @@ class FakeHTTP:
             if tid is not None:
                 try:
                     return self.squads_by_team.get(int(tid), self.response_payload)
+                except (TypeError, ValueError):
+                    pass
+        if endpoint == "/players/profiles" and self.profiles_by_player:
+            pid = params.get("player")
+            if pid is not None:
+                try:
+                    return self.profiles_by_player.get(
+                        int(pid), self.payload_for.get(endpoint, self.response_payload))
                 except (TypeError, ValueError):
                     pass
         if endpoint in self.payload_for:

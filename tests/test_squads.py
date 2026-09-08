@@ -161,6 +161,59 @@ def test_apply_transfer_ledger_bellingham_and_returnee():
     )
     assert {p["name"] for p in missing_arrival} == {"Kobel", "New Striker"}
 
+    # Fratele rămas la club (Jobe) nu e scos doar pentru că Jude e tot „J. Bellingham”.
+    jobe_kept = fd.apply_transfer_ledger(
+        [{"id": 326757, "name": "J. Bellingham", "age": 20, "pos": "M"},
+         {"id": 1, "name": "Kobel", "age": 28, "pos": "G"}],
+        {129718}, ["J. Bellingham"], [],
+    )
+    assert {p["id"] for p in jobe_kept} == {326757, 1}
+
+
+def test_squad_display_name_expands_initials():
+    assert fd.squad_display_name("J. Bellingham", {
+        "firstname": "Jobe Samuel Patrick", "lastname": "Bellingham",
+    }) == "Jobe Bellingham"
+    assert fd.squad_display_name("T. Courtois", {
+        "firstname": "Thibaut", "lastname": "Courtois",
+    }) == "Thibaut Courtois"
+    assert fd.squad_display_name("G. Kobel", None) == "G. Kobel"
+
+
+def test_annotate_availability_marks_injured_not_cards_over_injury():
+    players = [
+        {"id": 26243, "name": "Nico Schlotterbeck", "age": 26, "pos": "D"},
+        {"id": 864, "name": "Emre Can", "age": 32, "pos": "M"},
+        {"id": 3, "name": "Inacio", "age": 17, "pos": "A"},
+        {"id": 4, "name": "Kobel", "age": 28, "pos": "G"},
+    ]
+    injured = {
+        26243: {"reason": "Ankle Injury"},
+        864: {"reason": "Knee Injury"},
+        3: {"reason": "Red Card"},
+    }
+    out = {p["id"]: p for p in fd.annotate_availability(players, injured)}
+    assert out[26243]["injured"] is True
+    assert out[26243]["injury"] == "Ankle Injury"
+    assert out[864]["injured"] is True
+    assert out[3].get("injured") is None
+    assert out[3]["unavailable"] is True
+    assert out[4].get("injured") is None
+
+
+def test_apply_transfer_ledger_keeps_injured_even_if_marked_left():
+    players = [
+        {"id": 864, "name": "E. Can", "age": 32, "pos": "M"},
+        {"id": 129718, "name": "J. Bellingham", "age": 23, "pos": "M"},
+    ]
+    kept = fd.apply_transfer_ledger(
+        players, {864, 129718}, [], [],
+        appearances={}, injured_ids={864},
+    )
+    ids = {p["id"] for p in kept}
+    assert 864 in ids
+    assert 129718 not in ids
+
 
 async def test_get_team_squad_strips_players_also_on_reserve_team(fake_http):
     """API amestecă Castilla în lotul 541; scoatem id-urile de pe Real Madrid II
@@ -255,6 +308,60 @@ async def test_get_team_squad_drops_player_who_left_years_ago(fake_http):
     assert "Gregor Kobel" in names
     assert "J. Bellingham" not in names
     assert any(e == "/transfers" for e, _ in fake_http.calls)
+
+
+async def test_get_team_squad_keeps_injured_and_expands_names(fake_http):
+    fake_http.payload_for["/teams"] = [
+        {"team": {"id": 165, "name": "Borussia Dortmund"}},
+    ]
+    fake_http.payload_for["/players"] = [
+        {"player": {"id": 1, "firstname": "Gregor", "lastname": "Kobel", "age": 28},
+         "statistics": [{"games": {"appearences": 5}}]},
+        {"player": {"id": 326757, "firstname": "Jobe Samuel Patrick",
+                    "lastname": "Bellingham", "age": 20},
+         "statistics": [{"games": {"appearences": 3}}]},
+    ]
+    fake_http.payload_for["/injuries"] = [
+        {"team": {"id": 165},
+         "player": {"id": 26243, "name": "N. Schlotterbeck", "reason": "Ankle Injury"}},
+        {"team": {"id": 165},
+         "player": {"id": 864, "name": "E. Can", "reason": "Knee Injury"}},
+    ]
+    fake_http.payload_for["/transfers"] = [{
+        "player": {"id": 864, "name": "E. Can"},
+        "transfers": [{
+            "date": "2018-07-01", "type": "Free",
+            "teams": {"in": {"id": 496, "name": "Juventus"},
+                      "out": {"id": 40, "name": "Liverpool"}},
+        }],
+    }]
+    fake_http.profiles_by_player = {
+        26243: [{"player": {"id": 26243, "firstname": "Nico Cedric",
+                            "lastname": "Schlotterbeck"}}],
+        864: [{"player": {"id": 864, "firstname": "Emre", "lastname": "Can"}}],
+    }
+    fake_http.squads_by_team = {
+        165: [{
+            "team": {"id": 165, "name": "Borussia Dortmund"},
+            "players": [
+                {"id": 1, "name": "G. Kobel", "age": 28, "position": "Goalkeeper"},
+                {"id": 26243, "name": "N. Schlotterbeck", "age": 26, "position": "Defender"},
+                {"id": 326757, "name": "J. Bellingham", "age": 20, "position": "Midfielder"},
+            ],
+        }],
+    }
+    squad = await fd.get_team_squad(165)
+    by_id = {p["id"]: p for p in squad["players"]}
+    assert 864 in by_id
+    assert 26243 in by_id
+    assert by_id[864]["injured"] is True
+    assert by_id[864]["injury"] == "Knee Injury"
+    assert by_id[26243]["injured"] is True
+    assert by_id[26243]["injury"] == "Ankle Injury"
+    assert by_id[864]["name"] == "Emre Can"
+    assert by_id[26243]["name"] == "Nico Schlotterbeck"
+    assert by_id[326757]["name"] == "Jobe Bellingham"
+    assert by_id[1]["name"] == "Gregor Kobel"
 
 
 async def test_get_team_squad_on_b_team_keeps_own_players(fake_http):
@@ -376,6 +483,7 @@ def test_prompts_forbid_naming_players_from_memory():
     assert "get_team_squad" in p
     assert "PLAYERS" in p
     assert "shirt numbers" in p
+    assert "injured" in p
     assert "by_league" in p
     a = analysts._ANALYST_SYSTEM_PROMPT
     assert "squad.players" not in a

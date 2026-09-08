@@ -206,10 +206,11 @@ TOOLS: list[dict] = [
     },
     {
         "name": "get_team_squad",
-        "description": ("Lotul ACTUAL al unei echipe (nume, varsta, pozitie — fara numar de tricou). "
-                        "Foloseste-l cand vorbesti despre cine joaca la club ACUM. "
-                        "Listeaza doar nume si varsta; nu afisa si nu inventa numere de tricou. "
-                        "Nu inventa jucatori din memorie."),
+        "description": ("Lotul ACTUAL al unei echipe: nume complet, varsta, pozitie, "
+                        "fara numar de tricou. Include accidentatii (campul injured/injury) "
+                        "si indisponibilii (unavailable). Listeaza-i pe toti, cu mentiunea "
+                        "de accidentat langa nume. Nu scurta prenumele la initiala "
+                        "(Jobe Bellingham, nu J. Bellingham). Nu inventa jucatori."),
         "input_schema": {
             "type": "object",
             "properties": {"team_id": {"type": "integer"}},
