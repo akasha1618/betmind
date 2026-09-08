@@ -35,6 +35,95 @@ def test_squad_pack_from_api_shape():
     assert pack["players"][0]["pos"] == "G"
 
 
+def test_is_reserve_side_matches_academy_suffixes_not_other_clubs():
+    assert fd.is_reserve_side("Real Madrid", "Real Madrid II")
+    assert fd.is_reserve_side("Real Madrid", "Real Madrid III")
+    assert fd.is_reserve_side("Real Madrid II", "Real Madrid III")
+    assert fd.is_reserve_side("FC Barcelona", "FC Barcelona B")
+    assert fd.is_reserve_side("Bayern Munich", "Bayern Munich II")
+    assert fd.is_reserve_side("Chelsea", "Chelsea U21")
+    assert fd.is_reserve_side("Chelsea", "Chelsea U18")
+    assert fd.is_reserve_side("Juventus", "Juventus Next Gen")
+    assert not fd.is_reserve_side("Real Madrid II", "Real Madrid")
+    assert not fd.is_reserve_side("Real Madrid", "Real Madrid")
+    assert not fd.is_reserve_side("Real Madrid", "Real Madrid Women")
+    assert not fd.is_reserve_side("Inter", "Inter Miami")
+    assert not fd.is_reserve_side("Manchester United", "West Ham United")
+    assert not fd.is_reserve_side("Sporting CP", "Sporting Braga")
+
+
+async def test_get_team_squad_strips_players_also_on_reserve_team(fake_http):
+    """API amestecă Castilla în lotul 541; scoatem id-urile de pe Real Madrid II."""
+    fake_http.payload_for["/teams"] = [
+        {"team": {"id": 541, "name": "Real Madrid"}},
+        {"team": {"id": 9575, "name": "Real Madrid II"}},
+        {"team": {"id": 22142, "name": "Real Madrid III"}},
+        {"team": {"id": 9999, "name": "Real Madrid Women"}},
+    ]
+    fake_http.squads_by_team = {
+        541: [{
+            "team": {"id": 541, "name": "Real Madrid"},
+            "players": [
+                {"id": 730, "name": "T. Courtois", "number": 1, "position": "Goalkeeper"},
+                {"id": 762, "name": "Vinícius Júnior", "number": 7, "position": "Midfielder"},
+                {"id": 386872, "name": "Sergio Mestre", "number": 26, "position": "Goalkeeper"},
+                {"id": 443595, "name": "Jesús Fortea", "number": 2, "position": "Defender"},
+            ],
+        }],
+        9575: [{
+            "team": {"id": 9575, "name": "Real Madrid II"},
+            "players": [
+                {"id": 386872, "name": "Sergio Mestre", "number": 1, "position": "Goalkeeper"},
+                {"id": 443595, "name": "Jesús Fortea", "number": 2, "position": "Defender"},
+            ],
+        }],
+        22142: [{
+            "team": {"id": 22142, "name": "Real Madrid III"},
+            "players": [
+                {"id": 1, "name": "Some Cadet", "number": 10, "position": "Attacker"},
+            ],
+        }],
+    }
+    squad = await fd.get_team_squad(541)
+    names = {p["name"] for p in squad["players"]}
+    assert names == {"T. Courtois", "Vinícius Júnior"}
+    assert squad["count"] == 2
+    squad_calls = [(e, p) for e, p in fake_http.calls if e == "/players/squads"]
+    assert {"team": 541} in [p for _, p in squad_calls]
+    assert {"team": 9575} in [p for _, p in squad_calls]
+    # Women nu e filială — nu cerem lotul.
+    assert not any(p.get("team") == 9999 for _, p in squad_calls)
+
+
+async def test_get_team_squad_on_b_team_keeps_own_players(fake_http):
+    """Lotul filialei nu e golit de jucătorii care mai apar și la prima echipă."""
+    fake_http.payload_for["/teams"] = [
+        {"team": {"id": 541, "name": "Real Madrid"}},
+        {"team": {"id": 9575, "name": "Real Madrid II"}},
+        {"team": {"id": 22142, "name": "Real Madrid III"}},
+    ]
+    fake_http.squads_by_team = {
+        9575: [{
+            "team": {"id": 9575, "name": "Real Madrid II"},
+            "players": [
+                {"id": 386872, "name": "Sergio Mestre", "number": 1, "position": "Goalkeeper"},
+                {"id": 99, "name": "Cadet III", "number": 8, "position": "Midfielder"},
+            ],
+        }],
+        22142: [{
+            "team": {"id": 22142, "name": "Real Madrid III"},
+            "players": [
+                {"id": 99, "name": "Cadet III", "number": 8, "position": "Midfielder"},
+            ],
+        }],
+    }
+    squad = await fd.get_team_squad(9575)
+    names = {p["name"] for p in squad["players"]}
+    assert "Sergio Mestre" in names
+    assert "Cadet III" not in names
+    assert not any(p.get("team") == 541 for e, p in fake_http.calls if e == "/players/squads")
+
+
 async def test_get_team_squad_and_transfers(fake_http):
     today = date.today()
     fake_http.response_payload = [{

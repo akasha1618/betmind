@@ -95,11 +95,25 @@ class FakeHTTP:
     def __init__(self):
         self.calls: list[tuple[str, dict]] = []
         self.response_payload: list[dict] = []
+        self.payload_for: dict[str, list] = {}
+        self.squads_by_team: dict[int, list] = {}
         self.headers: dict[str, str] = {}
         # Pentru testele de diagnostic: status non-200 sau corp cu `errors`.
         self.status_code: int = 200
         self.errors: Any = []
         self.text_body: Optional[str] = None
+
+    def _payload(self, endpoint: str, params: dict) -> list:
+        if endpoint == "/players/squads" and self.squads_by_team:
+            tid = params.get("team")
+            if tid is not None:
+                try:
+                    return self.squads_by_team.get(int(tid), self.response_payload)
+                except (TypeError, ValueError):
+                    pass
+        if endpoint in self.payload_for:
+            return self.payload_for[endpoint]
+        return self.response_payload
 
     async def __call__(self, endpoint: str, params: dict, headers: dict) -> httpx.Response:
         self.calls.append((endpoint, dict(params)))
@@ -107,7 +121,7 @@ class FakeHTTP:
             return httpx.Response(self.status_code, text=self.text_body, headers=self.headers)
         return httpx.Response(
             self.status_code,
-            json={"errors": self.errors, "response": self.response_payload},
+            json={"errors": self.errors, "response": self._payload(endpoint, params)},
             headers=self.headers,
         )
 

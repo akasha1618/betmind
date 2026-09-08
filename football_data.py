@@ -68,6 +68,7 @@ TTL = {
     "squads": 12 * 3600,
     "transfers": 6 * 3600,
     "lineups": 15 * 60,
+    "teams": 24 * 3600,
     "player_search": 12 * 3600,
 }
 
@@ -1235,6 +1236,114 @@ def _parse_iso_date(value: Any) -> Optional[date]:
         return None
 
 
+# Sufixe de filială / academy, de la cel mai lung. Rang mai mare = mai junior.
+# Nu includem Women/Femenino: alt lot, alți jucători.
+_RESERVE_SUFFIX_RANK: dict[str, int] = {
+    "next gen": 1,
+    "nextgen": 1,
+    "reserves": 1,
+    "reserve": 1,
+    "amateure": 1,
+    "amateur": 1,
+    "castilla": 1,
+    "academy": 2,
+    "juvenil": 2,
+    "iii": 2,
+    "ii": 1,
+    "iv": 3,
+    "u23": 1,
+    "u21": 1,
+    "u20": 2,
+    "u19": 2,
+    "u18": 3,
+    "u17": 3,
+    "b": 1,
+    "c": 2,
+    "d": 3,
+    "2": 1,
+    "3": 2,
+}
+_MAX_RESERVE_SQUADS = 3
+
+
+def _norm_team_name(value: Any) -> str:
+    s = unicodedata.normalize("NFKD", str(value or ""))
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = re.sub(r"[.']+", "", s)
+    return re.sub(r"\s+", " ", s).strip().casefold()
+
+
+def _split_reserve_name(name: str) -> tuple[str, int]:
+    """(rădăcina clubului, rang filială). Rang 0 = prima echipă."""
+    n = _norm_team_name(name)
+    if not n:
+        return "", 0
+    for suffix in sorted(_RESERVE_SUFFIX_RANK, key=len, reverse=True):
+        token = " " + suffix
+        if n.endswith(token):
+            root = n[: -len(token)].strip()
+            if root:
+                return root, _RESERVE_SUFFIX_RANK[suffix]
+    return n, 0
+
+
+def is_reserve_side(parent_name: str, candidate_name: str) -> bool:
+    """True dacă candidate e filială a lui parent (II/B/U21…), nu invers."""
+    proot, prank = _split_reserve_name(parent_name)
+    croot, crank = _split_reserve_name(candidate_name)
+    return bool(proot and croot and proot == croot and crank > prank)
+
+
+def _teams_from_search(raw: Any) -> list[tuple[int, str]]:
+    out: list[tuple[int, str]] = []
+    for item in raw or []:
+        team = item.get("team") if isinstance(item, dict) else None
+        if not isinstance(team, dict):
+            team = item if isinstance(item, dict) else {}
+        tid, name = team.get("id"), team.get("name")
+        if tid is None or not name:
+            continue
+        try:
+            out.append((int(tid), str(name)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+async def _affiliated_reserve_ids(team_id: int, team_name: Optional[str]) -> list[int]:
+    """team_id-uri de filială pentru clubul dat. Gol dacă nu găsim / eșuează search-ul."""
+    name = (team_name or "").strip()
+    if not name:
+        return []
+    try:
+        raw = await _get("/teams", {"search": name}, "teams")
+    except FootballDataError:
+        log.warning("squad %s: nu am putut căuta filialele (%s)", team_id, name)
+        return []
+    ranked: list[tuple[int, int]] = []  # (rank, id)
+    seen: set[int] = set()
+    for tid, tname in _teams_from_search(raw):
+        if tid == team_id or tid in seen:
+            continue
+        if not is_reserve_side(name, tname):
+            continue
+        _, crank = _split_reserve_name(tname)
+        seen.add(tid)
+        ranked.append((crank, tid))
+    ranked.sort()
+    return [tid for _, tid in ranked[:_MAX_RESERVE_SQUADS]]
+
+
+async def _player_ids_on_squad(team_id: int) -> set[int]:
+    try:
+        raw = await _get("/players/squads", {"team": team_id}, "squads")
+    except FootballDataError:
+        log.warning("squad: lot filială team=%s indisponibil", team_id)
+        return set()
+    pack = _squad_pack(raw, team_id)
+    return {p["id"] for p in pack.get("players") or [] if p.get("id") is not None}
+
+
 def _squad_pack(raw: Any, team_id: int) -> dict:
     item = raw[0] if isinstance(raw, list) and raw else (raw if isinstance(raw, dict) else {})
     team = item.get("team") or {}
@@ -1259,12 +1368,32 @@ def _squad_pack(raw: Any, team_id: int) -> dict:
 
 
 async def get_team_squad(team_id: int) -> dict:
-    """Lotul curent al echipei (/players/squads). Sursa de adevăr: cine e ACUM."""
+    """Lotul curent al echipei (/players/squads). Sursa de adevăr: cine e ACUM.
+
+    API-Football amestecă adesea filialele (II/B/U21) în lotul primei echipe.
+    Scoatem jucătorii care apar și pe un lot de rezervă afiliat aceluiași club.
+    """
     raw = await _get("/players/squads", {"team": team_id}, "squads")
     if not raw:
         return {"team_id": team_id, "count": 0, "players": [],
                 "error": "Fără lot publicat pentru această echipă."}
-    return _squad_pack(raw, team_id)
+    pack = _squad_pack(raw, team_id)
+    reserve_ids = await _affiliated_reserve_ids(team_id, pack.get("team"))
+    if not reserve_ids:
+        return pack
+    academy: set[int] = set()
+    for rid in reserve_ids:
+        academy |= await _player_ids_on_squad(rid)
+    if not academy:
+        return pack
+    kept = [p for p in pack["players"] if p.get("id") not in academy]
+    dropped = pack["count"] - len(kept)
+    if dropped:
+        log.info("squad %s (%s): scos %s jucători de filială (teams %s)",
+                 team_id, pack.get("team"), dropped, reserve_ids)
+        pack["players"] = kept
+        pack["count"] = len(kept)
+    return pack
 
 
 def _transfer_row(player_name: str, move: dict, side: str) -> Optional[dict]:
