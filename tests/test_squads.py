@@ -92,6 +92,76 @@ def test_select_first_team_keeps_injured_and_apps_drops_academy_only():
     assert "Sergio Mestre" not in kept
 
 
+def test_transfer_ledger_drops_stale_departures_not_old_arrivals():
+    """Bellingham plecat în 2023: ultima mutare e out → scos, indiferent de vechime."""
+    dortmund = 165
+    raw = [{
+        "player": {"id": 129718, "name": "J. Bellingham"},
+        "transfers": [
+            {"date": "2023-06-14", "type": "€103M",
+             "teams": {"in": {"id": 541, "name": "Real Madrid"},
+                       "out": {"id": 165, "name": "Borussia Dortmund"}}},
+            {"date": "2020-07-20", "type": "€25M",
+             "teams": {"in": {"id": 165, "name": "Borussia Dortmund"},
+                       "out": {"id": 746, "name": "Birmingham"}}},
+        ],
+    }, {
+        "player": {"id": 99, "name": "Old Signing"},
+        "transfers": [
+            {"date": "2019-07-01", "type": "Free",
+             "teams": {"in": {"id": 165, "name": "Borussia Dortmund"},
+                       "out": {"id": 1, "name": "Elsewhere"}}},
+        ],
+    }]
+    left_ids, left_names, arrivals = fd.transfer_ledger(raw, dortmund)
+    assert 129718 in left_ids
+    assert any(fd.player_name_matches("Bellingham", n) for n in left_names)
+    assert all(a["name"] != "Old Signing" for a in arrivals)
+
+    season_in = date(fd.european_season(), 7, 15).isoformat()
+    raw.append({
+        "player": {"id": 42, "name": "New Striker"},
+        "transfers": [{
+            "date": season_in, "type": "€10M",
+            "teams": {"in": {"id": 165, "name": "Borussia Dortmund"},
+                      "out": {"id": 50, "name": "City"}},
+        }],
+    })
+    _, _, arrivals = fd.transfer_ledger(raw, dortmund)
+    assert any(a["id"] == 42 for a in arrivals)
+
+
+def test_apply_transfer_ledger_bellingham_and_returnee():
+    players = [
+        {"id": 129718, "name": "J. Bellingham", "age": 22, "pos": "M"},
+        {"id": 1, "name": "Gregor Kobel", "age": 28, "pos": "G"},
+        {"id": 2, "name": "Jude Nickname", "age": 22, "pos": "M"},
+    ]
+    left_ids, left_names, arrivals = {129718}, ["J. Bellingham"], []
+    kept = fd.apply_transfer_ledger(players, left_ids, left_names, arrivals)
+    names = {p["name"] for p in kept}
+    assert "J. Bellingham" not in names
+    assert "Gregor Kobel" in names
+    # still at club this season despite an old out in the dump
+    kept_apps = fd.apply_transfer_ledger(
+        players, {129718}, ["J. Bellingham"], [], appearances={129718: 3})
+    assert any(p["id"] == 129718 for p in kept_apps)
+
+    returned = fd.apply_transfer_ledger(
+        [{"id": 8, "name": "Loan Back", "age": 24, "pos": "D"}],
+        set(), [],
+        [{"id": 8, "name": "Loan Back", "pos": "?", "age": None}],
+    )
+    assert len(returned) == 1
+
+    missing_arrival = fd.apply_transfer_ledger(
+        [{"id": 1, "name": "Kobel", "age": 28, "pos": "G"}],
+        set(), [],
+        [{"id": 42, "name": "New Striker", "pos": "A", "age": 22}],
+    )
+    assert {p["name"] for p in missing_arrival} == {"Kobel", "New Striker"}
+
+
 async def test_get_team_squad_strips_players_also_on_reserve_team(fake_http):
     """API amestecă Castilla în lotul 541; scoatem id-urile de pe Real Madrid II
     doar dacă n-au jucat / nu sunt accidentați la prima echipă."""
@@ -115,6 +185,7 @@ async def test_get_team_squad_strips_players_also_on_reserve_team(fake_http):
          "player": {"id": 10009, "name": "Rodrygo",
                     "position": "Attacker", "age": 24}},
     ]
+    fake_http.payload_for["/transfers"] = []
     fake_http.squads_by_team = {
         541: [{
             "team": {"id": 541, "name": "Real Madrid"},
@@ -151,6 +222,39 @@ async def test_get_team_squad_strips_players_also_on_reserve_team(fake_http):
     assert {"team": 9575} in [p for _, p in squad_calls]
     # Women nu e filială — nu cerem lotul.
     assert not any(p.get("team") == 9999 for _, p in squad_calls)
+
+
+async def test_get_team_squad_drops_player_who_left_years_ago(fake_http):
+    fake_http.payload_for["/teams"] = [
+        {"team": {"id": 165, "name": "Borussia Dortmund"}},
+    ]
+    fake_http.payload_for["/players"] = [
+        {"player": {"id": 1, "name": "Gregor Kobel", "age": 28},
+         "statistics": [{"games": {"appearences": 5}}]},
+    ]
+    fake_http.payload_for["/injuries"] = []
+    fake_http.payload_for["/transfers"] = [{
+        "player": {"id": 129718, "name": "J. Bellingham"},
+        "transfers": [{
+            "date": "2023-06-14", "type": "€103M",
+            "teams": {"in": {"id": 541, "name": "Real Madrid"},
+                      "out": {"id": 165, "name": "Borussia Dortmund"}},
+        }],
+    }]
+    fake_http.squads_by_team = {
+        165: [{
+            "team": {"id": 165, "name": "Borussia Dortmund"},
+            "players": [
+                {"id": 1, "name": "Gregor Kobel", "age": 28, "position": "Goalkeeper"},
+                {"id": 129718, "name": "J. Bellingham", "age": 25, "position": "Midfielder"},
+            ],
+        }],
+    }
+    squad = await fd.get_team_squad(165)
+    names = {p["name"] for p in squad["players"]}
+    assert "Gregor Kobel" in names
+    assert "J. Bellingham" not in names
+    assert any(e == "/transfers" for e, _ in fake_http.calls)
 
 
 async def test_get_team_squad_on_b_team_keeps_own_players(fake_http):
@@ -190,12 +294,7 @@ async def test_get_team_squad_and_transfers(fake_http):
             {"id": 9, "name": "Erling Haaland", "position": "Attacker", "number": 9},
         ],
     }]
-    squad = await fd.get_team_squad(50)
-    assert squad["count"] == 1
-    assert squad["players"][0]["name"] == "Erling Haaland"
-    assert any(e == "/players/squads" for e, _ in fake_http.calls)
-
-    fake_http.response_payload = [{
+    fake_http.payload_for["/transfers"] = [{
         "player": {"name": "Kalvin Phillips"},
         "transfers": [{
             "date": (today - timedelta(days=10)).isoformat(),
@@ -212,6 +311,12 @@ async def test_get_team_squad_and_transfers(fake_http):
                       "out": {"id": 50, "name": "Manchester City"}},
         }],
     }]
+    squad = await fd.get_team_squad(50)
+    assert squad["count"] == 1
+    assert squad["players"][0]["name"] == "Erling Haaland"
+    assert any(e == "/players/squads" for e, _ in fake_http.calls)
+    assert any(e == "/transfers" for e, _ in fake_http.calls)
+
     xf = await fd.get_team_transfers(50, days=90)
     names_out = {t["name"] for t in xf["out"]}
     assert "Kalvin Phillips" in names_out

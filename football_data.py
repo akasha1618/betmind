@@ -1472,13 +1472,134 @@ def _squad_pack(raw: Any, team_id: int) -> dict:
     }
 
 
+def transfer_ledger(raw: Any, team_id: int) -> tuple[set[int], list[str], list[dict]]:
+    """Ultima mutare care atinge team_id, per jucător.
+
+    out după ultimul in → a plecat (inclusiv acum 3 ani).
+    in după ultimul out, în sezonul curent → sosire de adăugat dacă lipsește din lot.
+    """
+    left_ids: set[int] = set()
+    left_names: list[str] = []
+    arrivals: list[dict] = []
+    season_start = date(european_season(), 7, 1)
+    for item in raw or []:
+        p = item.get("player") or {}
+        pid, name = p.get("id"), (p.get("name") or "").strip()
+        dated: list[tuple[date, int, str]] = []
+        for idx, move in enumerate(item.get("transfers") or []):
+            when = _parse_iso_date(move.get("date"))
+            if when is None:
+                continue
+            teams = move.get("teams") or {}
+            in_id = ((teams.get("in") or {}).get("id"))
+            out_id = ((teams.get("out") or {}).get("id"))
+            if in_id == team_id and out_id == team_id:
+                continue
+            if in_id == team_id:
+                dated.append((when, idx, "in"))
+            elif out_id == team_id:
+                dated.append((when, idx, "out"))
+        if not dated:
+            continue
+        dated.sort()
+        when, _, direction = dated[-1]
+        pid_i: Optional[int] = None
+        if pid is not None:
+            try:
+                pid_i = int(pid)
+            except (TypeError, ValueError):
+                pid_i = None
+        if direction == "out":
+            if pid_i is not None:
+                left_ids.add(pid_i)
+            if name:
+                left_names.append(name)
+        elif when >= season_start and name:
+            arrivals.append({
+                "id": pid_i,
+                "name": name,
+                "pos": "?",
+                "age": None,
+            })
+    return left_ids, left_names, arrivals
+
+
+def _name_in_list(name: str, names: list[str]) -> bool:
+    if not name:
+        return False
+    return any(player_name_matches(name, other) or player_name_matches(other, name)
+               for other in names)
+
+
+def apply_transfer_ledger(
+    players: list[dict],
+    left_ids: set[int],
+    left_names: list[str],
+    arrivals: list[dict],
+    appearances: Optional[dict[int, int]] = None,
+) -> list[dict]:
+    """Scoate cine a plecat (ultima mutare e out). Adaugă sosiri din sezonul curent."""
+    appearances = appearances or {}
+    kept: list[dict] = []
+    for p in players:
+        pid, name = p.get("id"), p.get("name") or ""
+        pid_i: Optional[int] = None
+        if pid is not None:
+            try:
+                pid_i = int(pid)
+            except (TypeError, ValueError):
+                pid_i = None
+        left = (pid_i is not None and pid_i in left_ids) or _name_in_list(name, left_names)
+        if left and (pid_i is None or (appearances.get(pid_i) or 0) == 0):
+            continue
+        kept.append(p)
+    have_ids = {p.get("id") for p in kept if p.get("id") is not None}
+    have_names = [p.get("name") or "" for p in kept]
+    for row in arrivals:
+        rid, rname = row.get("id"), row.get("name") or ""
+        if rid is not None and rid in have_ids:
+            continue
+        if _name_in_list(rname, have_names):
+            continue
+        kept.append({
+            "id": rid,
+            "name": rname,
+            "pos": row.get("pos") or "?",
+            "age": row.get("age"),
+        })
+        if rid is not None:
+            have_ids.add(rid)
+        have_names.append(rname)
+    return kept
+
+
+async def _reconcile_squad_transfers(
+    pack: dict, team_id: int, appearances: Optional[dict[int, int]] = None,
+) -> dict:
+    try:
+        raw = await _get("/transfers", {"team": team_id}, "transfers")
+    except FootballDataError:
+        log.warning("squad %s: transferuri indisponibile, lot nerenconciliat", team_id)
+        return pack
+    left_ids, left_names, arrivals = transfer_ledger(raw, team_id)
+    before = pack["count"]
+    pack["players"] = apply_transfer_ledger(
+        pack["players"], left_ids, left_names, arrivals, appearances)
+    pack["count"] = len(pack["players"])
+    if pack["count"] != before:
+        log.info("squad %s (%s): după transferuri %s → %s (plecați %s, sosiri sezon %s)",
+                 team_id, pack.get("team"), before, pack["count"],
+                 len(left_ids), len(arrivals))
+    return pack
+
+
 async def get_team_squad(team_id: int) -> dict:
     """Lotul curent al echipei (/players/squads). Sursa de adevăr: cine e ACUM.
 
-    API-Football amestecă filialele în lotul primei echipe. Păstrăm jucătorul
-    dacă a avut apariții de primă echipă în sezon, e pe lista de accidentați
-    (inclusiv absenți lungi, care pot lipsi din /players/squads), sau e senior
-    și nu apare pe un lot de rezervă. Accidentații nu sunt excluși din lot.
+    API-Football amestecă filialele și poate lăsa jucători plecați de ani de zile
+    (lotul e un blob fără timestamp per jucător). După filtrul primă-echipă
+    reconciliem cu /transfers: scoatem pe cine ultima mutare e out, adăugăm
+    sosirile din sezonul curent care lipsesc din payload.
     """
     raw = await _get("/players/squads", {"team": team_id}, "squads")
     if not raw:
@@ -1501,7 +1622,7 @@ async def get_team_squad(team_id: int) -> dict:
                          team_id, team_name, dropped, reserve_ids)
                 pack["players"] = kept
                 pack["count"] = len(kept)
-        return pack
+        return await _reconcile_squad_transfers(pack, team_id)
 
     season = european_season()
     appearances = await _season_appearances(team_id, season)
@@ -1527,7 +1648,7 @@ async def get_team_squad(team_id: int) -> dict:
                  team_id, team_name, dropped, added)
     pack["players"] = kept
     pack["count"] = len(kept)
-    return pack
+    return await _reconcile_squad_transfers(pack, team_id, appearances)
 
 
 def _transfer_row(player_name: str, move: dict, side: str) -> Optional[dict]:
