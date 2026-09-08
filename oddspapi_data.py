@@ -57,6 +57,8 @@ BOOKMAKER_DISPLAY = "Superbet"      # numele afișat pe bilet + textul linkului
 
 ODDS_COOLDOWN_S = 0.55              # 500ms documentat + marjă
 SUMA_MIN, SUMA_MAX = 0.85, 1.20     # sanitate: suma 1/cotă pe o piață
+RETRY_SLEEP_CAP_S = 3.0             # 429: nu aștepta retryMs de minute întregi
+MAX_HTTP_ATTEMPTS = 3
 
 MARKETS_CACHE_KEY = "oddspapi_markets_football"
 MARKETS_MAX_AGE_H = 24 * 7          # /markets se schimbă foarte rar: refresh săptămânal
@@ -107,9 +109,11 @@ async def _get(path: str, params: Optional[dict] = None,
                incercari: int = 1) -> tuple[Optional[Any], Optional[str]]:
     """GET cu semantica validată în v4: cooldown 500ms între TOATE apelurile
     OddsPapi (limita e per cheie, nu per endpoint — /fixtures concurent cu
-    /odds dădea 429), retry pe 429 (retryMs din corp) și pe 500 (backoff)."""
+    /odds dădea 429), retry pe 429 (retryMs din corp, plafonat) și pe 500
+    (backoff). Nu reîncearcă la nesfârșit: max 3 încercări, sleep ≤ 3s."""
     global _last_odds_call
     ultima_eroare = None
+    incercari = min(max(1, incercari), MAX_HTTP_ATTEMPTS)
     for incercare in range(1, incercari + 1):
         p = {"apiKey": api_key()}
         p.update(params or {})
@@ -133,7 +137,10 @@ async def _get(path: str, params: Optional[dict] = None,
             except Exception:
                 retry_ms = 600
             ultima_eroare = "HTTP 429"
-            await asyncio.sleep((retry_ms / 1000.0) + 0.05)
+            if incercare >= incercari:
+                return None, ultima_eroare
+            sleep_s = min(RETRY_SLEEP_CAP_S, (float(retry_ms) / 1000.0) + 0.05)
+            await asyncio.sleep(sleep_s)
             continue
 
         if r.status_code == 500:
@@ -881,6 +888,11 @@ async def prefetch_for_fixtures(fixture_ids: list[int]) -> None:
     le găsește indiferent de timing."""
     if not enabled() or not fixture_ids:
         return
+    async with fd.background_api():
+        await _prefetch_for_fixtures(fixture_ids)
+
+
+async def _prefetch_for_fixtures(fixture_ids: list[int]) -> None:
     fxs: list[dict] = []
     days: list = []
     for fid in fixture_ids:
@@ -1011,6 +1023,7 @@ async def _llm_match_batch(
     if not items or not os.environ.get("ANTHROPIC_API_KEY", "").strip():
         return {}
     from anthropic import AsyncAnthropic
+    from llm_compat import anthropic_timeout_s
 
     payload = []
     for fx, cands in items:
@@ -1039,7 +1052,10 @@ async def _llm_match_batch(
         + json.dumps(payload, ensure_ascii=False)
     )
     model = os.environ.get("ANALYST_MODEL", "").strip() or "claude-haiku-4-5-20251001"
-    client = AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", "").strip())
+    client = AsyncAnthropic(
+        api_key=os.environ.get("ANTHROPIC_API_KEY", "").strip(),
+        timeout=anthropic_timeout_s(),
+    )
     msg = await asyncio.wait_for(
         client.messages.create(model=model, max_tokens=800, temperature=0,
                                messages=[{"role": "user", "content": prompt}]),

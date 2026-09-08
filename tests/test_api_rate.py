@@ -17,13 +17,17 @@ def _ok() -> httpx.Response:
 
 
 def test_rate_limit_defaults(monkeypatch):
+    monkeypatch.delenv("API_MAX_CONCURRENT", raising=False)
     monkeypatch.delenv("API_RATE_LIMIT_PER_MINUTE", raising=False)
     monkeypatch.delenv("API_FOOTBALL_RATE_LIMIT_PER_MINUTE", raising=False)
-    monkeypatch.delenv("API_MAX_CONCURRENT", raising=False)
+    monkeypatch.delenv("API_GATE_WAIT_S", raising=False)
     assert fd.rate_limit_per_minute() == 240
     assert fd.api_max_concurrent() == 8
     assert fd.rate_limiter_active() is True
     assert fd.api_http_attempts() == 3
+    assert fd.api_gate_wait_s() == 12
+    assert fd.api_interactive_reserve(8) == 2
+    assert fd.api_background_limit(8) == 6
 
 
 async def test_http_concurrent_cap(monkeypatch):
@@ -165,3 +169,64 @@ async def test_assemble_fetches_odds_before_other_endpoints(fake_http):
     await analysts.assemble_data_pack(1)
     assert fake_http.calls, "niciun apel HTTP"
     assert fake_http.calls[0][0] == "/odds"
+
+
+async def test_gate_times_out_instead_of_hanging(monkeypatch):
+    """Un slot ocupat nu poate tine restul cererilor la nesfarsit (499)."""
+    monkeypatch.setenv("API_MAX_CONCURRENT", "1")
+    monkeypatch.setenv("API_RATE_LIMIT_PER_MINUTE", "10000")
+    monkeypatch.setenv("API_GATE_WAIT_S", "0.12")
+    fd.reset_http_gate()
+    await db.init_db()
+
+    async def slow(endpoint, params, headers):
+        await asyncio.sleep(0.5)
+        return _ok()
+
+    monkeypatch.setattr(fd, "_http_get", slow)
+
+    async def first():
+        return await fd._get("/fixtures", {"team": 1, "last": 6}, "last_matches")
+
+    async def second():
+        await asyncio.sleep(0.02)
+        with pytest.raises(fd.FootballDataError) as exc:
+            await fd._get("/fixtures", {"team": 2, "last": 6}, "last_matches")
+        assert "timeout" in str(exc.value)
+
+    await asyncio.gather(first(), second())
+
+
+async def test_background_cannot_fill_all_slots(monkeypatch):
+    """Sync/prefetch nu au voie sa ocupe toate sloturile — chatul mai are loc."""
+    monkeypatch.setenv("API_MAX_CONCURRENT", "3")
+    monkeypatch.setenv("API_RATE_LIMIT_PER_MINUTE", "10000")
+    monkeypatch.setenv("API_GATE_WAIT_S", "0.2")
+    fd.reset_http_gate()
+    await db.init_db()
+    fg_ok = {"v": False}
+
+    async def slow(endpoint, params, headers):
+        await asyncio.sleep(0.35)
+        return _ok()
+
+    monkeypatch.setattr(fd, "_http_get", slow)
+
+    async def bg(i):
+        async with fd.background_api():
+            await fd._get("/fixtures", {"team": i, "last": 6}, "last_matches")
+
+    async def fg():
+        await asyncio.sleep(0.05)
+        await fd._get("/standings", {"league": 1, "season": 2026}, "standings")
+        fg_ok["v"] = True
+
+    t1 = asyncio.create_task(bg(1))
+    t2 = asyncio.create_task(bg(2))
+    await asyncio.sleep(0.03)
+    t3 = asyncio.create_task(bg(3))
+    await asyncio.gather(fg(), t1, t2)
+    assert fg_ok["v"] is True
+    with pytest.raises(fd.FootballDataError) as exc:
+        await t3
+    assert "timeout" in str(exc.value)

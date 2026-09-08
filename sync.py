@@ -79,9 +79,10 @@ async def sync_day(day: str) -> int:
     detectie de schimbari. Returneaza numarul de schimbari detectate.
     Ridica BudgetExhausted / FootballDataError mai departe.
     """
-    parsed = await fd.fetch_day(day)
-    n_changes = await fd.ingest_day(day, parsed)
-    return n_changes
+    async with fd.background_api():
+        parsed = await fd.fetch_day(day)
+        n_changes = await fd.ingest_day(day, parsed)
+        return n_changes
 
 
 async def run_sync_cycle(force: bool = False) -> dict:

@@ -21,6 +21,7 @@ from collections import defaultdict
 from typing import Any, AsyncGenerator, Optional
 
 from anthropic import AsyncAnthropic, APIStatusError
+from llm_compat import anthropic_timeout_s
 
 log = logging.getLogger("betmind.agent")
 
@@ -928,7 +929,7 @@ async def run_turn(messages: list[dict],
         MODEL, token_cap, len(messages), base_url, api_key[:12],
     )
 
-    client = AsyncAnthropic(api_key=api_key)
+    client = AsyncAnthropic(api_key=api_key, timeout=anthropic_timeout_s())
     system_prompt = build_system_prompt(mode)
     tools = build_tools(mode)
     turn_id = turn_id or uuid.uuid4().hex
@@ -1135,7 +1136,7 @@ async def ping_anthropic() -> dict:
     if not api_key:
         return {"ok": False, "error": "ANTHROPIC_API_KEY lipsește din .env"}
 
-    client = AsyncAnthropic(api_key=api_key)
+    client = AsyncAnthropic(api_key=api_key, timeout=anthropic_timeout_s())
     try:
         msg = await client.messages.create(
             model=MODEL,

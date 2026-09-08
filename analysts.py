@@ -31,7 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 import db
 import football_data as fd
 import oddspapi_data as op
-from llm_compat import messages_create
+from llm_compat import anthropic_timeout_s, messages_create
 
 log = logging.getLogger("betmind.analysts")
 
@@ -935,7 +935,10 @@ async def _call_analyst_llm(system: str, user_content: str) -> tuple[str, Any, s
     Mock-urile din teste pot intoarce in continuare (text, usage).
     temperature e optional: SDK-urile vechi nu il au — vezi llm_compat.
     """
-    client = AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", "").strip())
+    client = AsyncAnthropic(
+        api_key=os.environ.get("ANTHROPIC_API_KEY", "").strip(),
+        timeout=anthropic_timeout_s(),
+    )
     msg = await messages_create(client, **analyst_llm_create_kwargs(
         model=analyst_model(),
         max_tokens=analyst_max_tokens(),

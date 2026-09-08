@@ -25,9 +25,10 @@ import re
 import time
 import unicodedata
 from collections import Counter, OrderedDict, deque
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -318,6 +319,42 @@ def api_retry_backoff_base() -> float:
         return 1.0
 
 
+def api_gate_wait_s() -> float:
+    """Cat asteapta un apel la poarta inainte sa esueze (in loc sa atarne)."""
+    try:
+        return max(0.05, float(os.environ.get("API_GATE_WAIT_S", "12")))
+    except ValueError:
+        return 12.0
+
+
+def api_interactive_reserve(concurrent: Optional[int] = None) -> int:
+    """Sloturi pastrate pentru cereri interactive (chat), nu sync/prefetch."""
+    n = api_max_concurrent() if concurrent is None else concurrent
+    if n >= 4:
+        return 2
+    if n >= 2:
+        return 1
+    return 0
+
+
+def api_background_limit(concurrent: Optional[int] = None) -> int:
+    n = api_max_concurrent() if concurrent is None else concurrent
+    return max(1, n - api_interactive_reserve(n))
+
+
+_api_background: ContextVar[bool] = ContextVar("betmind_api_background", default=False)
+
+
+@asynccontextmanager
+async def background_api() -> AsyncIterator[None]:
+    """Marcheaza apelurile API-Football din acest task ca fundal (sync, prefetch)."""
+    token = _api_background.set(True)
+    try:
+        yield
+    finally:
+        _api_background.reset(token)
+
+
 def rate_limit_per_minute() -> Optional[int]:
     """Limita pe minut aplicata (env). Implicit 240, sub plafonul real ~300."""
     raw = (os.environ.get("API_RATE_LIMIT_PER_MINUTE")
@@ -340,13 +377,20 @@ def _is_odds_endpoint(endpoint: str) -> bool:
 
 
 class HttpGate:
-    """Semaphore de concurenta + token bucket pe minut, cu prioritate /odds."""
+    """Semaphore + token bucket pe minut, cu prioritate /odds.
+
+    Waiterii dorm pe Condition (nu pe sleep 5ms): un spin cu zeci de corutine
+    satura event loop-ul pe 1 vCPU si TOATE request-urile HTTP (inclusiv
+    pagina) cad in 499 — clientul inchide inainte sa primeasca raspuns.
+    """
 
     def __init__(self) -> None:
         self.concurrent = api_max_concurrent()
         self.rate = max(1, rate_limit_per_minute() or 240)
         self._sem = asyncio.Semaphore(self.concurrent)
+        self._bg_sem = asyncio.Semaphore(api_background_limit(self.concurrent))
         self._lock = asyncio.Lock()
+        self._cv = asyncio.Condition(self._lock)
         burst = float(min(self.concurrent, self.rate))
         self._tokens = burst
         self._burst = burst
@@ -360,37 +404,89 @@ class HttpGate:
         self._last = now
         self._tokens = min(self._burst, self._tokens + elapsed * self._rate_per_sec)
 
-    async def acquire(self, endpoint: str) -> None:
+    async def acquire(self, endpoint: str) -> str:
+        """Rezerva un slot. Intoarce 'bg' sau 'fg' — obligatoriu la release()."""
         is_odds = _is_odds_endpoint(endpoint)
-        if is_odds:
-            async with self._lock:
-                self._odds_waiters += 1
+        is_bg = _api_background.get()
+        kind = "bg" if is_bg else "fg"
+        deadline = time.monotonic() + api_gate_wait_s()
+        token_taken = False
+        odds_counted = False
+        bg_held = False
+
+        if is_bg:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise FootballDataError(
+                    "[timeout] API-Football ocupat — sync/prefetch a asteptat prea mult")
+            try:
+                await asyncio.wait_for(
+                    self._bg_sem.acquire(), timeout=max(0.01, remaining))
+            except asyncio.TimeoutError:
+                raise FootballDataError(
+                    "[timeout] API-Football ocupat — sync/prefetch a asteptat prea mult"
+                ) from None
+            bg_held = True
+
         try:
-            while True:
-                async with self._lock:
+            if is_odds:
+                async with self._cv:
+                    self._odds_waiters += 1
+                    odds_counted = True
+            async with self._cv:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise FootballDataError(
+                            "[timeout] API-Football prea aglomerat")
                     self._refill()
                     blocked = (not is_odds) and self._odds_waiters > 0
                     if not blocked and self._tokens >= 1.0:
                         self._tokens -= 1.0
+                        token_taken = True
+                        if odds_counted:
+                            self._odds_waiters -= 1
+                            odds_counted = False
+                            self._cv.notify_all()
                         break
+                    wait = 0.05
                     if self._tokens < 1.0 and self._rate_per_sec > 0:
                         wait = (1.0 - self._tokens) / self._rate_per_sec
-                    else:
-                        wait = 0.02
-                await asyncio.sleep(max(0.005, min(wait, 0.25)))
-            await self._sem.acquire()
+                    wait = min(0.25, max(0.01, wait), remaining)
+                    try:
+                        await asyncio.wait_for(self._cv.wait(), timeout=wait)
+                    except asyncio.TimeoutError:
+                        continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise FootballDataError("[timeout] API-Football prea aglomerat")
+            try:
+                await asyncio.wait_for(self._sem.acquire(), timeout=remaining)
+            except asyncio.TimeoutError:
+                raise FootballDataError(
+                    "[timeout] API-Football prea aglomerat") from None
+            return kind
         except BaseException:
-            if is_odds:
-                async with self._lock:
-                    self._odds_waiters -= 1
+            if token_taken:
+                async with self._cv:
+                    self._tokens = min(self._burst, self._tokens + 1.0)
+                    self._cv.notify_all()
+            if bg_held:
+                self._bg_sem.release()
+                bg_held = False
             raise
-        else:
-            if is_odds:
-                async with self._lock:
+        finally:
+            if odds_counted:
+                async with self._cv:
                     self._odds_waiters -= 1
+                    self._cv.notify_all()
 
-    def release(self) -> None:
+    async def release(self, kind: str = "fg") -> None:
         self._sem.release()
+        if kind == "bg":
+            self._bg_sem.release()
+        async with self._cv:
+            self._cv.notify_all()
 
 
 _http_gate: Optional[HttpGate] = None
@@ -400,6 +496,7 @@ def reset_http_gate() -> None:
     """Reciteste env (teste)."""
     global _http_gate
     _http_gate = None
+    _api_background.set(False)
 
 
 def _gate() -> HttpGate:
@@ -470,9 +567,12 @@ def _api_key() -> str:
     return key
 
 
+_HTTP_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
+
+
 async def _http_get(endpoint: str, params: dict, headers: dict) -> httpx.Response:
     """Cererea HTTP bruta — separata ca sa poata fi mock-uita in teste."""
-    async with httpx.AsyncClient(timeout=25) as client:
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
         return await client.get(f"{BASE_URL}{endpoint}", params=params, headers=headers)
 
 
@@ -531,7 +631,7 @@ def _retry_delay(attempt: int, retry_after: Optional[str]) -> float:
         return 0.0  # teste: retry instant, ignora Retry-After
     if retry_after:
         try:
-            delay = max(delay, min(float(retry_after), 30.0))
+            delay = max(delay, min(float(retry_after), 8.0))
         except (TypeError, ValueError):
             pass
     return delay
@@ -566,7 +666,7 @@ async def _get_http(endpoint: str, params: dict, ttl_key: str, cache_id: str) ->
                 f"({used} folosite azi). Raspund din baza locala."
             )
 
-        await _gate().acquire(endpoint)
+        slot = await _gate().acquire(endpoint)
         started = time.monotonic()
         try:
             try:
@@ -618,7 +718,7 @@ async def _get_http(endpoint: str, params: dict, ttl_key: str, cache_id: str) ->
                     _record_api_error(*rec)
                 raise last_error
         finally:
-            _gate().release()
+            await _gate().release(slot)
 
         if retryable and attempt < attempts - 1:
             await asyncio.sleep(delay)

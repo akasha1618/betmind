@@ -4,12 +4,21 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 import re
 from typing import Any, Callable
 
 log = logging.getLogger("betmind.llm")
 
 _UNEXPECTED_KW = re.compile(r"unexpected keyword argument ['\"](\w+)['\"]")
+
+
+def anthropic_timeout_s() -> float:
+    """Timeout pe clientul Anthropic — fara el un apel hung tine worker-ul ocupat."""
+    try:
+        return max(5.0, float(os.environ.get("ANTHROPIC_TIMEOUT_S", "90")))
+    except ValueError:
+        return 90.0
 
 
 def supported_kwargs(fn: Callable, kwargs: dict[str, Any]) -> dict[str, Any]:

@@ -13,6 +13,7 @@ import logging
 import os
 
 from anthropic import AsyncAnthropic
+from llm_compat import anthropic_timeout_s
 
 import db
 import football_data as fd
@@ -68,7 +69,10 @@ def clean_title(raw: str) -> str:
 
 async def _call_llm(user_content: str):
     """Un apel scurt la modelul de titluri. Separat ca sa fie mock-uibil."""
-    client = AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", "").strip())
+    client = AsyncAnthropic(
+        api_key=os.environ.get("ANTHROPIC_API_KEY", "").strip(),
+        timeout=anthropic_timeout_s(),
+    )
     msg = await client.messages.create(
         model=title_model(),
         max_tokens=32,

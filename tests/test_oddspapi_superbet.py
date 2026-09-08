@@ -344,6 +344,30 @@ async def test_cooldown_500ms_intre_apeluri_odds(oddspapi):
     assert starturi[1] - starturi[0] >= op.ODDS_COOLDOWN_S - 0.05
 
 
+async def test_429_retry_sleep_is_capped(monkeypatch):
+    """retryMs mare de la OddsPapi nu poate tine worker-ul ocupat minute intregi."""
+    monkeypatch.setenv("ODDSPAPI_KEY", "cheie-test")
+    sleeps: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def spy(delay, *args, **kwargs):
+        sleeps.append(float(delay))
+        await real_sleep(0)
+
+    monkeypatch.setattr(op.asyncio, "sleep", spy)
+
+    async def http(url, params):
+        return httpx.Response(429, json={"error": {"retryMs": 120000}})
+
+    monkeypatch.setattr(op, "_http_get", http)
+    op._last_odds_call = time.monotonic()
+    data, err = await op._get("/odds", {"fixtureId": "x"}, incercari=3)
+    assert data is None
+    assert err == "HTTP 429"
+    assert sleeps
+    assert all(s <= op.RETRY_SLEEP_CAP_S + 0.01 for s in sleeps)
+
+
 async def test_markets_cache_persistent_si_refresh_saptamanal(oddspapi):
     await op.get_markets_map()
     assert oddspapi.n_calls("markets") == 1
