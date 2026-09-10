@@ -63,10 +63,9 @@ def isolated_env(tmp_path, monkeypatch):
     # testele ei o simuleaza patch-uind functia.
     monkeypatch.setenv("ODDSPAPI_LLM_MATCH", "0")
     import oddspapi_data as op
+    op.reset_runtime_state()
     op._markets_mem = None
     op._markets_mem_at = 0.0
-    op._last_odds_call = 0.0
-    op._fixtures_cache.clear()
     op._odds_lock = asyncio.Lock()
     op._markets_lock = asyncio.Lock()
     op._fixtures_lock = asyncio.Lock()

@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 import uuid
 import asyncio
 from collections import defaultdict
@@ -69,6 +70,38 @@ def max_tokens() -> int:
     except ValueError:
         n = _MAX_TOKENS_CEILING
     return max(256, min(n, _MAX_TOKENS_CEILING))
+
+
+def turn_deadline_s() -> float:
+    """Plafon pe toată tura — sub timeout-ul proxy (300s) ca pagina să nu rămână 499."""
+    try:
+        return max(30.0, float(os.environ.get("TURN_DEADLINE_S", "180")))
+    except ValueError:
+        return 180.0
+
+
+def tool_timeout_s() -> float:
+    try:
+        return max(5.0, float(os.environ.get("TOOL_TIMEOUT_S", "45")))
+    except ValueError:
+        return 45.0
+
+
+async def _anext_or_end(it):
+    try:
+        return await it.__anext__(), True
+    except StopAsyncIteration:
+        return None, False
+
+
+async def _aiter_timeout(source, timeout_s: float):
+    """Oprește un stream Anthropic care nu mai trimite evenimente."""
+    it = source.__aiter__()
+    while True:
+        item, ok = await asyncio.wait_for(_anext_or_end(it), timeout=timeout_s)
+        if not ok:
+            return
+        yield item
 
 
 # Compat: importatorii vechi citesc constanta la load; run_turn foloseste functia.
@@ -936,6 +969,8 @@ async def run_turn(messages: list[dict],
     continues = 0
     last_ticket_selections: list = []
     analyzed_fixture_ids: list[int] = []
+    deadline = time.monotonic() + turn_deadline_s()
+    stream_timeout = anthropic_timeout_s()
 
     try:
         if _should_abort_max_tokens_loop(conversation_id):
@@ -953,6 +988,10 @@ async def run_turn(messages: list[dict],
             return
 
         for iteration in range(MAX_AGENT_ITERATIONS):
+            if time.monotonic() >= deadline:
+                yield {"type": "error",
+                       "message": "Cererea a durat prea mult. Încearcă din nou."}
+                return
             if iteration == 0:
                 yield {"type": "status", "label": "Mă gândesc…"}
             log.debug("Anthropic stream iteration=%d", iteration + 1)
@@ -964,10 +1003,12 @@ async def run_turn(messages: list[dict],
                 tools=tools_c,
                 messages=messages_c,
             ) as stream:
-                async for event in stream:
+                async for event in _aiter_timeout(stream, stream_timeout):
                     if event.type == "text":
                         yield {"type": "delta", "text": event.text}
-                final = await stream.get_final_message()
+                remain = max(1.0, deadline - time.monotonic())
+                final = await asyncio.wait_for(
+                    stream.get_final_message(), timeout=min(stream_timeout, remain))
 
             log.info(
                 "Anthropic response stop_reason=%s input_tokens=%s output_tokens=%s",
@@ -1093,9 +1134,14 @@ async def run_turn(messages: list[dict],
                     yield {"type": "status",
                            "label": await status_label(block.name, block.input or {},
                                                        index=idx, total=len(siblings))}
-                    result = await _execute_tool(block.name, block.input or {},
-                                                 conversation_id, user_key,
-                                                 user_text=_latest_user_text(messages))
+                    try:
+                        result = await asyncio.wait_for(
+                            _execute_tool(block.name, block.input or {},
+                                          conversation_id, user_key,
+                                          user_text=_latest_user_text(messages)),
+                            timeout=tool_timeout_s())
+                    except asyncio.TimeoutError:
+                        result = {"error": "Unealta a durat prea mult și a fost oprită."}
                 log.debug("Tool result %s: %s", block.name, json.dumps(result, ensure_ascii=False)[:500])
                 analyzed_fixture_ids.extend(_fixture_ids_from_tool(
                     block.name, block.input or {}, result))
@@ -1125,6 +1171,10 @@ async def run_turn(messages: list[dict],
             e.status_code, request_id, MODEL, body or e.body,
         )
         yield {"type": "error", "message": _user_facing_api_error(e)}
+    except asyncio.TimeoutError:
+        log.error("run_turn timed out waiting for an external API")
+        yield {"type": "error",
+               "message": "Serviciile externe au durat prea mult. Încearcă din nou."}
     except Exception as e:
         log.exception("Unexpected error in run_turn")
         yield {"type": "error", "message": f"Eroare neașteptată: {type(e).__name__}: {e}"}

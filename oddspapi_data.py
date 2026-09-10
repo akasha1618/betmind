@@ -59,12 +59,15 @@ ODDS_COOLDOWN_S = 0.55              # 500ms documentat + marjă
 SUMA_MIN, SUMA_MAX = 0.85, 1.20     # sanitate: suma 1/cotă pe o piață
 RETRY_SLEEP_CAP_S = 3.0             # 429: nu aștepta retryMs de minute întregi
 MAX_HTTP_ATTEMPTS = 3
+CIRCUIT_THRESHOLD = 3               # 429 consecutive → oprim apelurile
+CIRCUIT_COOLDOWN_S = 45.0           # cât stă circuitul deschis
 
 MARKETS_CACHE_KEY = "oddspapi_markets_football"
 MARKETS_MAX_AGE_H = 24 * 7          # /markets se schimbă foarte rar: refresh săptămânal
 FIXTURES_TTL_S = 15 * 60            # feed-ul de fixtures OddsPapi, cache în memorie
 KICKOFF_TOLERANCE_S = 3 * 3600      # ±3 ore la potrivirea meciurilor
 HTTP_TIMEOUT_S = 12.0
+_HTTP_TIMEOUT = httpx.Timeout(connect=5.0, read=15.0, write=10.0, pool=5.0)
 # Cât mai așteptăm cererea Superbet DUPĂ ce restul pachetului de date e gata.
 # /odds e serializat (cooldown 500ms), deci un shortlist de 10–13 meciuri
 # umple coada ~6–8s; 3s tăia linkurile de pe majoritatea rândurilor.
@@ -94,68 +97,140 @@ def enabled() -> bool:
 # HTTP + coada rate-limitată pentru /odds (portat din oddspapi_v4.get)
 # ---------------------------------------------------------------------------
 
-_odds_lock = asyncio.Lock()   # serializează /odds la nivel de proces (per cheie)
+_odds_lock = asyncio.Lock()   # doar rezervarea slotului, NU request-ul HTTP
 _last_odds_call = 0.0
+_next_slot = 0.0
+
+
+class _CircuitBreaker:
+    """După 429 repetate, oprim OddsPapi — run_turn nu stă la coadă la nesfârșit."""
+
+    def __init__(self) -> None:
+        self.failures = 0
+        self.open_until = 0.0
+
+    def reset(self) -> None:
+        self.failures = 0
+        self.open_until = 0.0
+
+    def allow(self) -> bool:
+        return time.monotonic() >= self.open_until
+
+    def record_success(self) -> None:
+        self.failures = 0
+        self.open_until = 0.0
+
+    def record_failure(self) -> None:
+        self.failures += 1
+        try:
+            threshold = max(1, int(os.environ.get(
+                "ODDSPAPI_CIRCUIT_THRESHOLD", str(CIRCUIT_THRESHOLD))))
+        except ValueError:
+            threshold = CIRCUIT_THRESHOLD
+        if self.failures < threshold:
+            return
+        try:
+            cooldown = max(1.0, float(os.environ.get(
+                "ODDSPAPI_CIRCUIT_COOLDOWN_S", str(CIRCUIT_COOLDOWN_S))))
+        except ValueError:
+            cooldown = CIRCUIT_COOLDOWN_S
+        self.open_until = time.monotonic() + cooldown
+        log.warning(
+            "OddsPapi circuit deschis %.0fs după %d eșecuri consecutive",
+            cooldown, self.failures,
+        )
+
+
+_circuit = _CircuitBreaker()
+
+
+def _lock_wait_s() -> float:
+    try:
+        return max(0.05, float(os.environ.get("ODDSPAPI_LOCK_WAIT_S", "8")))
+    except ValueError:
+        return 8.0
+
+
+def _retry_sleep_s(incercare: int) -> float:
+    """Backoff exponențial 0.4, 0.8, 1.6… plafonat — nu retryMs de minute."""
+    return min(RETRY_SLEEP_CAP_S, 0.4 * (2 ** max(0, incercare - 1)))
 
 
 async def _http_get(url: str, params: dict) -> httpx.Response:
     """Singurul punct care atinge rețeaua — testele îl înlocuiesc."""
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
         return await client.get(url, params=params)
+
+
+async def _take_slot() -> Optional[str]:
+    """Rezervă un start spațiat. None = poți apela HTTP. Altfel sari apelul."""
+    global _next_slot, _last_odds_call
+    if not _circuit.allow():
+        return "circuit_open"
+    wait = 0.0
+    async with _odds_lock:
+        now = time.monotonic()
+        start = max(now, _next_slot)
+        wait = start - now
+        if wait > _lock_wait_s():
+            return "queue_timeout"
+        _next_slot = start + ODDS_COOLDOWN_S
+        _last_odds_call = start
+    if wait > 0:
+        await asyncio.sleep(wait)
+    if not _circuit.allow():
+        return "circuit_open"
+    return None
 
 
 async def _get(path: str, params: Optional[dict] = None,
                respect_odds_cooldown: bool = False,
                incercari: int = 1) -> tuple[Optional[Any], Optional[str]]:
-    """GET cu semantica validată în v4: cooldown 500ms între TOATE apelurile
-    OddsPapi (limita e per cheie, nu per endpoint — /fixtures concurent cu
-    /odds dădea 429), retry pe 429 (retryMs din corp, plafonat) și pe 500
-    (backoff). Nu reîncearcă la nesfârșit: max 3 încercări, sleep ≤ 3s."""
-    global _last_odds_call
+    """GET cu cooldown între START-uri (nu în timpul HTTP), retry pe 429/500
+    cu backoff exponențial (max 3) și circuit breaker. HTTP-ul nu ține lock-ul
+    — altfel 8 analiști × /odds umpleu coada și run_turn atârnă 5 minute."""
     ultima_eroare = None
     incercari = min(max(1, incercari), MAX_HTTP_ATTEMPTS)
     for incercare in range(1, incercari + 1):
+        blocked = await _take_slot()
+        if blocked:
+            return None, blocked
         p = {"apiKey": api_key()}
         p.update(params or {})
         try:
-            async with _odds_lock:
-                asteapta = ODDS_COOLDOWN_S - (time.monotonic() - _last_odds_call)
-                if asteapta > 0:
-                    await asyncio.sleep(asteapta)
-                # Cooldown-ul se măsoară între START-urile cererilor: așa
-                # coada nu adaugă și durata HTTP la fiecare pas.
-                _last_odds_call = time.monotonic()
-                r = await _http_get(f"{BASE}{path}", p)
+            r = await _http_get(f"{BASE}{path}", p)
         except httpx.HTTPError as e:
             ultima_eroare = f"eroare retea: {e}"
-            await asyncio.sleep(0.5 * incercare)
+            _circuit.record_failure()
+            if incercare >= incercari:
+                return None, ultima_eroare
+            await asyncio.sleep(_retry_sleep_s(incercare))
             continue
 
         if r.status_code == 429:
-            try:
-                retry_ms = r.json().get("error", {}).get("retryMs", 600)
-            except Exception:
-                retry_ms = 600
             ultima_eroare = "HTTP 429"
+            _circuit.record_failure()
             if incercare >= incercari:
                 return None, ultima_eroare
-            sleep_s = min(RETRY_SLEEP_CAP_S, (float(retry_ms) / 1000.0) + 0.05)
-            await asyncio.sleep(sleep_s)
+            await asyncio.sleep(_retry_sleep_s(incercare))
             continue
 
         if r.status_code == 500:
             ultima_eroare = f"HTTP 500: {r.text[:200]}"
+            _circuit.record_failure()
             if incercare < incercari:
-                await asyncio.sleep(1.0 * incercare)
+                await asyncio.sleep(_retry_sleep_s(incercare))
                 continue
             return None, ultima_eroare
 
         if r.status_code != 200:
             return None, f"HTTP {r.status_code}: {r.text[:300]}"
         try:
-            return r.json(), None
+            payload = r.json()
         except Exception as e:
             return None, f"raspuns non-JSON: {e}"
+        _circuit.record_success()
+        return payload, None
     return None, ultima_eroare or "esuat dupa reincercari"
 
 
@@ -217,6 +292,7 @@ def _parse_markets(mk_raw: Any) -> dict[str, dict]:
 async def get_markets_map(force: bool = False) -> dict[str, dict]:
     """Definițiile piețelor, cu cache DB (7 zile) și degradare pe cache vechi."""
     global _markets_mem, _markets_mem_at
+    cached = None
     async with _markets_lock:
         if _markets_mem is not None and not force and \
                 time.monotonic() - _markets_mem_at < 6 * 3600:
@@ -232,25 +308,32 @@ async def get_markets_map(force: bool = False) -> dict[str, dict]:
                     mk_raw = json.loads(cached["json"])
             except (ValueError, TypeError, json.JSONDecodeError):
                 mk_raw = None
+        if mk_raw is not None:
+            _markets_mem = _parse_markets(mk_raw)
+            _markets_mem_at = time.monotonic()
+            return _markets_mem
 
-        if mk_raw is None:
-            raw, err = await _get("/markets", {"sportId": SPORT_FOOTBALL}, incercari=3)
-            if err or raw is None:
-                log.warning("OddsPapi /markets indisponibil: %s", err)
-                if cached:
-                    # degradare elegantă: cache-ul vechi e mai bun decât nimic
-                    try:
-                        mk_raw = json.loads(cached["json"])
-                    except json.JSONDecodeError:
-                        mk_raw = []
-                else:
-                    mk_raw = []
-            else:
-                mk_raw = raw
-                await db.oddspapi_cache_set(
-                    MARKETS_CACHE_KEY, json.dumps(raw, ensure_ascii=False),
-                    datetime.now(timezone.utc).isoformat())
+    # HTTP în afara lock-ului: altfel toți analiștii așteaptă /markets.
+    raw, err = await _get("/markets", {"sportId": SPORT_FOOTBALL}, incercari=3)
+    if err or raw is None:
+        log.warning("OddsPapi /markets indisponibil: %s", err)
+        if cached:
+            try:
+                mk_raw = json.loads(cached["json"])
+            except json.JSONDecodeError:
+                mk_raw = []
+        else:
+            mk_raw = []
+    else:
+        mk_raw = raw
+        await db.oddspapi_cache_set(
+            MARKETS_CACHE_KEY, json.dumps(raw, ensure_ascii=False),
+            datetime.now(timezone.utc).isoformat())
 
+    async with _markets_lock:
+        if _markets_mem is not None and not force and \
+                time.monotonic() - _markets_mem_at < 6 * 3600:
+            return _markets_mem
         _markets_mem = _parse_markets(mk_raw)
         _markets_mem_at = time.monotonic()
         return _markets_mem
@@ -737,9 +820,13 @@ PACK_LINK_MAX_AGE_S = 6 * 3600  # linkul rămâne valid mult după ce cota expir
 
 def reset_runtime_state() -> None:
     """Cache-uri de proces — testele le golesc ca să nu se scurgă între cazuri."""
+    global _last_odds_call, _next_slot
     _sb_mem.clear()
     _sb_inflight.clear()
     _fixtures_cache.clear()
+    _circuit.reset()
+    _last_odds_call = 0.0
+    _next_slot = 0.0
 
 
 def _sb_entry(fid: int) -> Optional[tuple[float, Optional[dict]]]:
@@ -887,6 +974,9 @@ async def prefetch_for_fixtures(fixture_ids: list[int]) -> None:
     nimic pe drumul cererii. Mapările și cotele ajung în DB, deci biletul
     le găsește indiferent de timing."""
     if not enabled() or not fixture_ids:
+        return
+    if not _circuit.allow():
+        log.info("OddsPapi: circuit deschis — prefetch omis")
         return
     async with fd.background_api():
         await _prefetch_for_fixtures(fixture_ids)
@@ -1125,7 +1215,9 @@ async def apply_superbet_to_selections(selections: Optional[list]) -> None:
                 if fx:
                     tasks.append(asyncio.create_task(superbet_for_fixture(fx)))
             if tasks:
-                await asyncio.wait(tasks, timeout=WAIT_BUDGET_S)
+                _done, pending = await asyncio.wait(tasks, timeout=WAIT_BUDGET_S)
+                for t in pending:
+                    t.cancel()
     else:
         log.warning("OddsPapi: ODDSPAPI_KEY lipsă — biletul iese fără link Superbet")
 
