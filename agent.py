@@ -136,7 +136,7 @@ TOOLS: list[dict] = [
         "description": ("Lista meciurilor dintr-un interval de zile (max 7), optional filtrata pe ligi. "
                         "Returneaza fixture_id, echipe cu id-uri, liga, sezon, ora, plus by_league "
                         "(cate meciuri per competitie). Daca userul cere o competitie "
-                        "(Champions League, Liga I…), TRECI league_ids — altfel primesti TOATE "
+                        "(Champions League, Nations League, Liga I…), TRECI league_ids — altfel primesti TOATE "
                         "ligile urmarite si count-ul NU e al acelei competitii. "
                         "Fara league_ids foloseste ligile implicite de top."),
         "input_schema": {

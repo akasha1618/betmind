@@ -49,6 +49,7 @@ DEFAULT_LEAGUES: dict[int, str] = {
     2: "UEFA Champions League",
     3: "UEFA Europa League",
     848: "UEFA Conference League",
+    5: "UEFA Nations League",
     283: "Liga I (Romania)",
     1: "World Cup",
     88: "Eredivisie (Olanda)",

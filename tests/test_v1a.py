@@ -328,7 +328,7 @@ async def test_track_league_resolves_and_persists(fake_http):
 
     tracked = await db.get_tracked_leagues()
     assert 185 in tracked
-    assert await db.count_tracked_leagues() == 13  # 12 implicite + 1 noua
+    assert await db.count_tracked_leagues() == 14  # 13 implicite + 1 noua
 
 
 async def test_track_league_ambiguous_returns_candidates(fake_http):
@@ -342,7 +342,7 @@ async def test_track_league_ambiguous_returns_candidates(fake_http):
     res = await fd.track_league("Super Cup")
     assert "multiple_matches" in res
     assert len(res["multiple_matches"]) == 2
-    assert await db.count_tracked_leagues() == 12  # nimic adaugat inca
+    assert await db.count_tracked_leagues() == 13  # nimic adaugat inca
 
 
 # ---------------------------------------------------------------------------

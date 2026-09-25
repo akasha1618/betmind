@@ -6,8 +6,9 @@ aplicatia; fiecare browser isi pastreaza user_key-ul propriu din localStorage,
 deci istoricul ramane separat per tester.
 
 Sesiunea e un cookie HTTP-only semnat (BETMIND_SESSION), valabil 30 de zile:
-    v1.<expira_la_epoch>.<hmac_sha256(SESSION_SECRET, "v1.<expira_la>")>
-Nu stocam nimic pe server — verificarea e doar semnatura + termenul.
+    v1.<expira_la_epoch>.<hmac(SESSION_SECRET, "v1.<expira>.<hash(parola)>")>
+Semnatura e legata de ACCESS_PASSWORD: daca schimbi parola, cookie-urile
+vechi pică și testerii trebuie să se logheze din nou.
 
 Daca ACCESS_PASSWORD nu e setat, aplicatia ruleaza deschis (dev local).
 """
@@ -53,6 +54,11 @@ def _secret() -> bytes:
     return (os.environ.get("SESSION_SECRET", "").strip() or _ephemeral_secret).encode()
 
 
+def _password_tag() -> str:
+    """Amprenta parolei din cookie: alta parola => alta semnatura."""
+    return hashlib.sha256(access_password().encode()).hexdigest()[:16]
+
+
 def trust_proxy_headers() -> bool:
     return os.environ.get("TRUST_PROXY_HEADERS", "").strip().lower() in ("1", "true", "yes")
 
@@ -62,7 +68,9 @@ def password_matches(candidate: str) -> bool:
 
 
 def _sign(payload: str) -> str:
-    return hmac.new(_secret(), payload.encode(), hashlib.sha256).hexdigest()
+    return hmac.new(
+        _secret(), f"{payload}.{_password_tag()}".encode(), hashlib.sha256
+    ).hexdigest()
 
 
 def make_session_cookie(now: float | None = None) -> str:

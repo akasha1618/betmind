@@ -116,6 +116,15 @@ async def test_expired_cookie_rejected(gated):
     assert auth.verify_session_cookie(auth.make_session_cookie()) is True
 
 
+async def test_password_change_invalidates_old_cookies(gated, monkeypatch):
+    """Dupa schimbarea ACCESS_PASSWORD, sesiunile vechi trebuie sa ceara login."""
+    cookie = auth.make_session_cookie()
+    assert auth.verify_session_cookie(cookie) is True
+    monkeypatch.setenv("ACCESS_PASSWORD", "parola-noua-dupa-schimbare")
+    assert auth.verify_session_cookie(cookie) is False
+    assert auth.verify_session_cookie(auth.make_session_cookie()) is True
+
+
 # --------------------------------------------------------------- (b) gate off
 
 async def test_without_password_everything_open(no_http):

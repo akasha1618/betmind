@@ -39,7 +39,7 @@ async def test_health_reports_sync_metadata(no_http):
     assert body["sync_ok"] is True
     assert body["api_requests_used_today"] == 4
     assert body["budget_limit"] == 50
-    assert body["tracked_leagues_count"] == 12
+    assert body["tracked_leagues_count"] == 13
     assert body["fixtures_in_db"] == 1
     assert body["timezone"] == "Europe/Bucharest"
     assert body["sync_enabled"] is False  # SYNC_ENABLED=false in teste
