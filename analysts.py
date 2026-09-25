@@ -850,6 +850,8 @@ RULES:
 - BANNED generic phrases (never use, in any language): "echipă de calitate", "echipă superioară/consacrată", "formă bună" without numbers, "meci deschis", "tradițional cu goluri", "meci de tempo ridicat", "outsider clar" without the odds, "favorită clară" without numbers. If a claim cannot be grounded in pack data, DROP it.
 - angle: ONE non-obvious connection grounded in pack data: schedule congestion (days_since_last_match), midweek European game, stakes/table context, promoted side, key absence chain. One or two sentences, in Romanian.
 - The API-Football predictions block is one signal among many — never copy it as your conclusion.
+- If the pack has odds, you MUST emit at least 2 best_candidates even when season_stats.available is false, standings_row is null, or injuries are empty. That is normal for Nations League / internationals / early campaigns. Use last_matches, H2H and implied odds; set confidence to "low". Empty season aggregates are NOT a failed analysis.
+- NEVER claim the data source "does not cover" a year, "only has 2022–2024", or that season 2026 is blocked. Those claims are false.
 - data_gaps: copy the pack's gaps that actually limited you, plus any you noticed. Lower your confidence accordingly. data_gaps and top_factors MUST be JSON arrays of strings, never a stringified array.
 - kickoff is already Romania local time — repeat it as-is, never convert.
 - Be honest: thin data => hedged probabilities and "low" confidence."""

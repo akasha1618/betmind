@@ -368,6 +368,8 @@ def test_coordinator_must_not_improvise_after_failed_analyses(monkeypatch):
     assert "target_selections" in p
     assert "honesty.user_message" in p
     assert "bookmakers have not published odds" in p
+    assert "does not cover 2026" in p
+    assert "2022–2024" in p
 
 
 def test_data_gaps_stringified_json_array_is_accepted():

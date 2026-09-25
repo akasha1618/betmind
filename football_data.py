@@ -1214,8 +1214,24 @@ async def get_team_statistics(team_id: int, league_id: int, season: int) -> dict
     raw = await _get("/teams/statistics",
                      {"team": team_id, "league": league_id, "season": season},
                      "team_stats")
+    if isinstance(raw, list):
+        raw = raw[0] if raw else {}
     if not raw:
-        return {"error": "Fara statistici pentru combinatia echipa/liga/sezon."}
+        return {
+            "available": False,
+            "note": ("Statistici de sezon goale (frecvent la naționale / început "
+                     "de campanie). Baza analizei: last_matches, H2H și cotele — "
+                     "nu înseamnă că sezonul nu e acoperit."),
+            "form_last_matches": None,
+            "played": {},
+            "wins": {},
+            "draws": {},
+            "loses": {},
+            "avg_goals_scored": {"home": None, "away": None, "total": None},
+            "avg_goals_conceded": {"home": None, "away": None, "total": None},
+            "clean_sheets": None,
+            "failed_to_score": None,
+        }
     g = raw.get("goals", {})
     fixtures = raw.get("fixtures", {})
 
@@ -1223,6 +1239,7 @@ async def get_team_statistics(team_id: int, league_id: int, season: int) -> dict
         return ((g.get(direction) or {}).get("average") or {}).get(side)
 
     return {
+        "available": True,
         "team": (raw.get("team") or {}).get("name"),
         "form_last_matches": raw.get("form"),  # ex: "WWDLW"
         "played": (fixtures.get("played") or {}),
@@ -2065,23 +2082,40 @@ async def lookup_player(name: str, team_id: Optional[int] = None) -> dict:
     }
 
 
-async def get_standings(league_id: int, season: int) -> list[dict]:
-    """Clasamentul unei ligi."""
-    raw = await _get("/standings", {"league": league_id, "season": season}, "standings")
+def _standings_groups(raw: Any) -> list[list]:
+    """UNL / WC / Euro au standings ca lista de grupe, nu un singur tabel."""
     if not raw:
         return []
-    table = ((raw[0].get("league") or {}).get("standings") or [[]])[0]
+    blocks = raw if isinstance(raw, list) else [raw]
+    groups: list[list] = []
+    for block in blocks:
+        tables = ((block or {}).get("league") or {}).get("standings") or []
+        if not tables:
+            continue
+        if isinstance(tables[0], dict):
+            groups.append(tables)
+        else:
+            groups.extend(g for g in tables if isinstance(g, list))
+    return groups
+
+
+async def get_standings(league_id: int, season: int) -> list[dict]:
+    """Clasamentul unei ligi (toate grupele, nu doar prima)."""
+    raw = await _get("/standings", {"league": league_id, "season": season}, "standings")
     out = []
-    for row in table:
-        out.append({
-            "rank": row.get("rank"),
-            "team": (row.get("team") or {}).get("name"),
-            "team_id": (row.get("team") or {}).get("id"),
-            "points": row.get("points"),
-            "played": (row.get("all") or {}).get("played"),
-            "goal_diff": row.get("goalsDiff"),
-            "form": row.get("form"),
-        })
+    for table in _standings_groups(raw):
+        for row in table:
+            if not isinstance(row, dict):
+                continue
+            out.append({
+                "rank": row.get("rank"),
+                "team": (row.get("team") or {}).get("name"),
+                "team_id": (row.get("team") or {}).get("id"),
+                "points": row.get("points"),
+                "played": (row.get("all") or {}).get("played"),
+                "goal_diff": row.get("goalsDiff"),
+                "form": row.get("form"),
+            })
     return out
 
 

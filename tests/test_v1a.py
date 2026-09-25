@@ -358,3 +358,20 @@ def test_status_group_mapping():
     assert fd.status_group("AET") == "finished"
     assert fd.status_group("PST") == "other"
     assert fd.status_group("CANC") == "other"
+
+
+def _standing_row(team_id: int, name: str) -> dict:
+    return {"rank": team_id, "team": {"id": team_id, "name": name},
+            "points": 3, "all": {"played": 1}, "goalsDiff": 1, "form": "W"}
+
+
+async def test_standings_flattens_nations_league_groups(fake_http):
+    """UNL are mai multe grupe — nu pastram doar prima, altfel Italia/Belgia dispar."""
+    fake_http.response_payload = [{
+        "league": {"standings": [
+            [_standing_row(768, "Italy"), _standing_row(1, "Belgium")],
+            [_standing_row(2, "France"), _standing_row(777, "Turkey")],
+        ]}
+    }]
+    rows = await fd.get_standings(5, 2026)
+    assert {r["team_id"] for r in rows} == {768, 1, 2, 777}
