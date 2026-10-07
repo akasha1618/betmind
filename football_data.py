@@ -24,7 +24,7 @@ import os
 import re
 import time
 import unicodedata
-from collections import Counter, OrderedDict, deque
+from collections import Counter, OrderedDict, defaultdict, deque
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
@@ -868,6 +868,43 @@ def _fixture_out(p: dict) -> dict:
     }
 
 
+# Cate meciuri intra in prompt: destule pentru shortlist (6–10), nu 120+ care
+# umplu cache-ul Sonnet. by_league ramane pe TOATE, deci o liga taiata se
+# recheama cu league_ids.
+MAX_FIXTURES_FOR_LLM = 64
+
+
+def prioritize_fixtures_for_llm(fixtures: list[dict],
+                                cap: int = MAX_FIXTURES_FOR_LLM) -> list[dict]:
+    """Upcoming intai, apoi round-robin pe ligi (Liga I nu e acoperita de PL)."""
+    if len(fixtures) <= cap:
+        return list(fixtures)
+    upcoming = [f for f in fixtures if f.get("status_group") == "upcoming"]
+    rest = [f for f in fixtures if f.get("status_group") != "upcoming"]
+    by_lg: dict[Any, list[dict]] = defaultdict(list)
+    for f in upcoming + rest:
+        by_lg[f.get("league_id")].append(f)
+    order = list(DEFAULT_LEAGUES.keys())
+    extra = [lid for lid in by_lg if lid not in DEFAULT_LEAGUES]
+    order.extend(sorted(extra, key=lambda x: (x is None, str(x))))
+    idxs = {lid: 0 for lid in by_lg}
+    listed: list[dict] = []
+    while len(listed) < cap:
+        added = False
+        for lid in order:
+            bucket = by_lg.get(lid) or []
+            i = idxs.get(lid, 0)
+            if i < len(bucket):
+                listed.append(bucket[i])
+                idxs[lid] = i + 1
+                added = True
+                if len(listed) >= cap:
+                    break
+        if not added:
+            break
+    return listed
+
+
 async def ingest_day(day: str, parsed: list[dict]) -> int:
     """Upsert ligile urmărite + șterge meciurile rămase pe ziua asta fără
     să mai apară în răspunsul API (rundele viitoare cu dată greșită)."""
@@ -1072,7 +1109,7 @@ async def get_fixtures(date_from: str, date_to: Optional[str] = None,
     else:
         source = "mixed"
 
-    listed = out[:120]
+    listed = prioritize_fixtures_for_llm(out)
     result = {
         "count": len(out),
         "listed": len(listed),
@@ -1090,9 +1127,10 @@ async def get_fixtures(date_from: str, date_to: Optional[str] = None,
     }
     if len(out) > len(listed):
         result["truncated"] = True
-        result["note"] += (f" Lista e tăiată la {len(listed)} din {len(out)}. "
+        result["note"] += (f" Lista e tăiată la {len(listed)} din {len(out)} "
+                           "(mix pe ligi, upcoming întâi). "
                            "Pentru o competiție anume, recheamă cu league_ids "
-                           "(Champions League = 2, Europa League = 3, Conference = 848).")
+                           "(Champions League = 2, Europa League = 3, Conference = 848, Liga I = 283).")
     if budget_exhausted:
         result["budget_exhausted"] = True
         result["note"] += (" ATENTIE: bugetul API de azi e epuizat; datele vin din baza locala "

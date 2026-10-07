@@ -337,14 +337,21 @@ async def test_loaded_history_passed_intact_to_model_without_duplication(no_http
     assert _finished_ok(_sse_events(resp.text))
 
     sent = captured[0]["messages"]
-    # Istoric intact (tool_use + tool_result incluse) + noul mesaj — fara duplicare.
+    # Perechile tool_use/tool_result raman, dar JSON-ul vechi e stub — altfel
+    # fiecare follow-up re-factureaza zeci de mii de tokeni. Fara duplicare.
     assert len(sent) == 4 + 1
-    assert sent[:4] == stored
+    assert sent[0] == stored[0]
+    assert sent[1] == stored[1]
+    assert sent[2]["content"][0]["tool_use_id"] == "tu1"
+    assert sent[2]["content"][0]["content"] == agent._COMPACTED_TOOL_RESULT
+    assert sent[3] == stored[3]
     assert sent[4]["role"] == "user"
     assert "mai e valabil biletul?" in json.dumps(sent[4], ensure_ascii=False)
 
-    # In DB nu s-a duplicat nimic: 4 vechi + user nou + assistant nou.
+    # In DB istoricul complet e pastrat: 4 vechi + user nou + assistant nou.
     assert await db.count_messages("conv-r") == 6
+    db_msgs = await db.get_messages("conv-r")
+    assert "local_db" in db_msgs[2]["content"][0]["content"]
 
 
 @pytest.mark.parametrize("mode", ["analysts", "classic"])

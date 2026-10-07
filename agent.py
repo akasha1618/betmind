@@ -1024,6 +1024,45 @@ def _inject_ticket_links(assistant_msg: dict, selections: list) -> Optional[str]
     return patched
 
 
+_COMPACTED_TOOL_RESULT = '{"compacted":true}'
+
+
+def compact_history_for_llm(messages: list[dict]) -> list[dict]:
+    """Turele vechi: stub la tool_result. Tura curenta ramane intacta.
+
+    Follow-up-urile din aceeasi conversatie reincarcau JSON-ul de 50–80k
+    tokeni (program + cote) la fiecare mesaj nou. Raspunsul vizibil si
+    perechile tool_use/tool_result raman; datele se re-cer daca trebuie.
+    Istoricul din memorie/DB nu e mutat — lucram pe copii.
+    """
+    current_start = 0
+    for i, m in enumerate(messages):
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            current_start = i
+    out: list[dict] = []
+    stubbed = 0
+    for i, m in enumerate(messages):
+        if i >= current_start:
+            out.append(m)
+            continue
+        content = m.get("content")
+        if m.get("role") == "user" and isinstance(content, list):
+            stubbed_blocks = []
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    stubbed_blocks.append({**b, "content": _COMPACTED_TOOL_RESULT})
+                    stubbed += 1
+                else:
+                    stubbed_blocks.append(b)
+            out.append({**m, "content": stubbed_blocks})
+        else:
+            out.append(m)
+    if stubbed:
+        log.info("LLM history compacted: stubbed %d old tool_results (keep from msg %d)",
+                 stubbed, current_start)
+    return out
+
+
 def _with_cache_markers(system_prompt: str, tools: list[dict],
                         messages: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
     """
@@ -1040,7 +1079,7 @@ def _with_cache_markers(system_prompt: str, tools: list[dict],
     if tools_marked:
         tools_marked[-1] = {**tools_marked[-1], "cache_control": {"type": "ephemeral"}}
 
-    msgs = list(messages)
+    msgs = compact_history_for_llm(messages)
     if msgs:
         last = dict(msgs[-1])
         content = last["content"]

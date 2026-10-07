@@ -623,3 +623,56 @@ def test_prompt_mode_argument_overrides_environment(monkeypatch):
     assert "analyze_matches" not in prompts.build_system_prompt("classic")
     # Fara argument ramane comportamentul din .env (compatibilitate V1-B/C).
     assert "analyze_matches" not in prompts.build_system_prompt()
+
+
+def test_old_tool_results_are_stubbed_before_the_current_turn():
+    """Follow-up-ul nu retrimite JSON-ul de 50k tokeni din tura anterioara."""
+    fat = json.dumps({"fixtures": [{"fixture_id": i} for i in range(120)]})
+    history = [
+        {"role": "user", "content": "bilet azi"},
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "Caut…"},
+            {"type": "tool_use", "id": "t1", "name": "get_fixtures", "input": {}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": fat},
+        ]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Nu sunt meciuri azi."}]},
+        {"role": "user", "content": "atunci pe saptamana viitoare"},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t2", "name": "get_fixtures", "input": {}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t2", "content": '{"count":3}'},
+        ]},
+    ]
+    compact = agent.compact_history_for_llm(history)
+    old = compact[2]["content"][0]["content"]
+    assert old == agent._COMPACTED_TOOL_RESULT
+    assert "fixture_id" not in old
+    # Tura curenta (dupa ultimul mesaj user-text) ramane intreaga.
+    assert compact[6]["content"][0]["content"] == '{"count":3}'
+    # Istoricul original nu e mutat — persistarea pastreaza datele.
+    assert "fixture_id" in history[2]["content"][0]["content"]
+
+    _, _, msgs = agent._with_cache_markers("SYS", agent.build_tools("classic"), history)
+    assert msgs[2]["content"][0]["content"] == agent._COMPACTED_TOOL_RESULT
+    assert msgs[-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_fixture_list_round_robins_leagues_instead_of_dumping_120():
+    rows = []
+    for lid, n in ((39, 40), (140, 40), (283, 40)):
+        for i in range(n):
+            rows.append({
+                "fixture_id": lid * 100 + i,
+                "league_id": lid,
+                "status_group": "upcoming",
+                "kickoff": f"2026-10-13T{18 + i % 4}:00:00+03:00",
+            })
+    listed = fd.prioritize_fixtures_for_llm(rows, cap=12)
+    assert len(listed) == 12
+    by_lg = {}
+    for f in listed:
+        by_lg[f["league_id"]] = by_lg.get(f["league_id"], 0) + 1
+    assert by_lg[39] == 4 and by_lg[140] == 4 and by_lg[283] == 4
