@@ -135,7 +135,8 @@ TOOLS: list[dict] = [
         "name": "get_fixtures",
         "description": ("Lista meciurilor dintr-un interval de zile (max 7), optional filtrata pe ligi. "
                         "Returneaza fixture_id, echipe cu id-uri, liga, sezon, ora, plus by_league "
-                        "(cate meciuri per competitie). Daca userul cere o competitie "
+                        "(cate meciuri per competitie). fixtures e un tabel — ordinea coloanelor "
+                        "e in campul row; leagues da numele ligii dupa league_id. Daca userul cere o competitie "
                         "(Champions League, Nations League, Liga I…), TRECI league_ids — altfel primesti TOATE "
                         "ligile urmarite si count-ul NU e al acelei competitii. "
                         "Fara league_ids foloseste ligile implicite de top."),
@@ -314,9 +315,11 @@ TOOLS: list[dict] = [
                             "pick": {"type": "string", "description": "ex: '1', 'Over 2.5', 'Yes'"},
                             "odds": {"type": "number"},
                             "prob": {"type": "number", "description": "probabilitatea ta estimata, 0-1"},
-                            "kickoff": {"type": "string", "description": "ISO datetime, optional"},
+                            "kickoff": {"type": "string",
+                                        "description": "'YYYY-MM-DD HH:MM' din get_fixtures (sau ISO), optional"},
                             "league": {"type": "string", "description": "numele ligii, optional"},
-                            "reason": {"type": "string", "description": "motivatia scurta, optional"},
+                            "reason": {"type": "string",
+                                       "description": "max 15 cuvinte, optional — argumentatia completa o scrii in raspuns"},
                             "confidence": {"type": "string", "enum": ["high", "medium", "low"],
                                            "description": "increderea analizei pentru acest meci, optional"},
                             "edge": {"type": "number",
@@ -760,36 +763,44 @@ def _compact_odds_for_llm(odds: dict) -> dict:
     return out
 
 
+FIXTURE_ROW_FORMAT = ("[fixture_id, weekday, kickoff 'YYYY-MM-DD HH:MM' (ora României), "
+                      "league_id, season, home_id, home, away_id, away] + status doar dacă "
+                      "meciul NU e upcoming (nu-l recomanda)")
+
+
 def _compact_fixtures_for_llm(result: dict) -> dict:
-    """Lista de meciuri rămâne completă (același shortlist), fără meta inutilă."""
+    """Aceleasi meciuri, ca tabel: ~3x mai putini tokeni decat un dict per meci.
+
+    Nu renuntam la niciun camp de decizie: id-uri (pentru cote/forma), liga,
+    sezon, ora locala. kickoff 'YYYY-MM-DD HH:MM' merge si in build_ticket.
+    """
+    leagues: dict[str, str] = {}
     fixtures = []
     for f in result.get("fixtures") or []:
-        row = {
-            "fixture_id": f.get("fixture_id"),
-            "date": f.get("date"),
-            "weekday": f.get("weekday"),
-            "time": f.get("time"),
-            "kickoff": f.get("kickoff"),
-            "status_group": f.get("status_group"),
-            "league": f.get("league"),
-            "league_id": f.get("league_id"),
-            "season": f.get("season"),
-            "home": f.get("home"),
-            "away": f.get("away"),
-        }
-        if f.get("status_group") != "upcoming" and f.get("status"):
-            row["status"] = f["status"]
+        home, away = f.get("home") or {}, f.get("away") or {}
+        lid = f.get("league_id")
+        if lid is not None and f.get("league"):
+            leagues.setdefault(str(lid), f["league"])
+        row = [f.get("fixture_id"), f.get("weekday"),
+               f"{f.get('date') or ''} {f.get('time') or ''}".strip(),
+               lid, f.get("season"), home.get("id"), home.get("name"),
+               away.get("id"), away.get("name")]
+        if f.get("status_group") != "upcoming":
+            row.append(f.get("status") or f.get("status_group"))
         fixtures.append(row)
     out: dict[str, Any] = {
         "count": result.get("count"),
         "listed": result.get("listed"),
         "by_league": result.get("by_league"),
         "source": result.get("source"),
+        "leagues": leagues,
+        "row": FIXTURE_ROW_FORMAT,
         "fixtures": fixtures,
     }
     if result.get("truncated"):
         out["truncated"] = True
-        out["note"] = result.get("note")
+        out["note"] = (f"Lista e tăiată la {result.get('listed')} din {result.get('count')} "
+                       "(mix pe ligi, upcoming întâi). Pentru o ligă anume recheamă cu league_ids.")
     if result.get("budget_exhausted"):
         out["budget_exhausted"] = True
         out["note"] = "Buget API epuizat; datele pot fi vechi."

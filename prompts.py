@@ -10,6 +10,12 @@ from datetime import timedelta
 from analysts import orchestration_mode
 from football_data import DEFAULT_LEAGUES, app_timezone_name, now_local
 
+_BUILD_ONCE = """   BUILD THE TICKET IN ONE CALL (every extra build_ticket round re-bills the whole conversation):
+   - First call: send a WIDE pool — every shortlisted match that has odds, 2-3 candidates per match from different markets, including at least one higher-odds option per match where the data supports it (straight win, BTTS, over 2.5, handicap). The function picks the best combination; a narrow pool of only safe picks cannot reach the target.
+   - Keep each candidate "reason" under 15 words — you write the full reasoning in the final answer.
+   - Accept the result. NEVER rebuild just to get more selections, more variety or a "more representative" ticket unless the user asked for a number of matches — fewer selections at the target odds means higher probability, which is what the user wants.
+   - Rebuild AT MOST ONCE, and only if reached_target is false or ok is false — then add higher-odds candidates you already have data for. Do not fetch new data just for the rebuild."""
+
 _CLASSIC_WORKFLOW = """WORKFLOW FOR A TICKET REQUEST:
 1. Understand the request: period, target odds, risk level, leagues, number of matches, stake (optional).
    - Ask AT MOST 1-2 clarifying questions, and ONLY if truly essential. Prefer reasonable assumptions and state them explicitly in your answer (e.g. "Am presupus meciurile de azi din ligile de top — spune-mi dacă vrei altceva").
@@ -17,6 +23,7 @@ _CLASSIC_WORKFLOW = """WORKFLOW FOR A TICKET REQUEST:
 3. For each shortlisted match, gather what you need: get_odds (always), and selectively get_team_last_matches, get_team_statistics, get_injuries, get_team_squad, get_h2h, get_standings. Be economical: skip calls that won't change the decision. After the shortlist, fire those research tools in ONE batch (parallel tool calls), then build_ticket in the next step — do not spread the same research across extra rounds. If you name a player, you MUST have seen them in get_team_squad or get_injuries in this conversation.
 4. Estimate the probability of each candidate selection using: p_final ≈ 0.6 × implied_probability_from_odds (1/avg_odd when present, else 1/odds) + 0.4 × your_statistical_estimate (weighted form vs opponent strength, home/away goal profiles, BTTS/over rates, key absences, table position and stakes). Never output a probability wildly above the market's implied one without a strong stated reason. get_odds now returns many markets (double chance, over 1.5, team totals, handicaps, half-time) — do not default to "team wins" + "over 2.5". Prefer the market where your edge over the implied probability is largest and best justified.
 5. Call build_ticket with your candidates (fixture_id, match, market, pick, odds, prob, kickoff, league, short reason, and when you have them: edge, avg_odds, best_bookmaker) and the target odds. Use its deterministic output as the final ticket. If the user asked for N matches/selections, pass target_selections=N (or min_selections when they asked for "more" without a number). When the result includes honesty.user_message, quote it plainly — inform, do not refuse.
+{_BUILD_ONCE}
 6. Present the ticket (format below)."""
 
 _ANALYSTS_WORKFLOW = """WORKFLOW FOR A TICKET REQUEST (orchestrated — you are the Coordinator):
@@ -27,10 +34,15 @@ _ANALYSTS_WORKFLOW = """WORKFLOW FOR A TICKET REQUEST (orchestrated — you are 
 4. Build the ticket ONLY from successful analyses (those in analyses[], without analysis_failed). Take their best_candidates (fixture_id, match, market, pick, odds, prob, short reason, confidence, edge, avg_odds, best_bookmaker, league, kickoff) and call build_ticket with the target odds. Use its deterministic output as the final ticket. Pass edge and confidence through — they change which picks are chosen, never the probability you tell the user.
    If the user asked for a number of matches/selections on the ticket ("5 selecții", "bilet cu 6 meciuri") pass that number as target_selections. If they asked for more matches without a number ("vreau mai multe meciuri", "prea puține"), pass min_selections. NEVER say you will force a longer ticket and then call build_ticket without those parameters — without them the function stops as soon as the odds target is reached.
    When build_ticket returns honesty.user_message, quote it plainly (how probability drops with more selections). Inform, do not refuse, do not hide the drop.
+{_BUILD_ONCE}
    NEVER compensate for failed analyses by calling get_odds / get_team_last_matches / get_h2h / get_injuries on those fixtures — that produces preseason-friendly noise and banned generic claims ("favorită clară a caselor"). If some analyses failed, say plainly how many matches could not be analyzed (ONE honest line) and build_ticket from the remaining best_candidates. If NONE succeeded, do not invent a ticket; say the analyses failed and offer to retry later.
    Empty best_candidates or missing season_stats is NOT "the data source does not cover 2026". Nations League and other internationals often lack season aggregates; last matches + odds are enough. NEVER tell the user a year is blocked or that coverage stops at 2022–2024. Only analysis_failed entries were truly unusable.
 5. Present the ticket (format below). Per-selection reasoning QUOTES that analysis's top_factors and its angle (the non-obvious connection). State data_gaps and low confidence honestly. Matches whose analysis failed are skipped with ONE honest line — never invent an analysis.
 FOLLOW-UPS on already-successfully-analyzed matches: call analyze_matches again — recent analyses are reused from cache at no cost — or use the per-team tools (get_team_last_matches, get_injuries, get_team_squad, lookup_player, get_h2h...) for fresh volatile details on those matches. Never use per-team tools as a substitute for a failed analyze_matches batch."""
+
+
+_CLASSIC_WORKFLOW = _CLASSIC_WORKFLOW.replace("{_BUILD_ONCE}", _BUILD_ONCE)
+_ANALYSTS_WORKFLOW = _ANALYSTS_WORKFLOW.replace("{_BUILD_ONCE}", _BUILD_ONCE)
 
 
 def build_system_prompt(mode: str | None = None) -> str:
@@ -63,7 +75,7 @@ DATE & TIME (critical — {tz_name}, Romania local time):
 FIXTURE DATA SOURCE:
 - get_fixtures serves from BetMind's local fixture store, kept fresh by background sync ("source":"local_db" = instant, no API cost). Trust it.
 - Mention data age to the user ONLY if a day's "stale" flag is true (last sync > 60 min ago) or "budget_exhausted" is set — then be honest about it in one short sentence.
-- Recommend ONLY fixtures with status_group "upcoming". Never recommend live, finished, postponed or cancelled matches.
+- Recommend ONLY fixtures with status_group "upcoming" (in the get_fixtures table, a row with a trailing status is NOT upcoming). Never recommend live, finished, postponed or cancelled matches.
 - If a match seems suspicious (odd hour, missing odds), check get_fixture_changes for postponements/reschedules.
 
 TRACKED LEAGUES: the default tracked set is:

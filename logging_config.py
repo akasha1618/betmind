@@ -4,7 +4,24 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
+
+_SECRET_QUERY = re.compile(r"((?:api_?key|apikey|token|key)=)[^&\s\"']+", re.IGNORECASE)
+
+
+class RedactSecretsFilter(logging.Filter):
+    """httpx logheaza URL-ul complet; OddsPapi pune cheia in query string."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        redacted = _SECRET_QUERY.sub(r"\1***", message)
+        if redacted != message:
+            record.msg, record.args = redacted, None
+        return True
 
 
 def setup_logging() -> logging.Logger:
@@ -18,6 +35,9 @@ def setup_logging() -> logging.Logger:
         stream=sys.stdout,
         force=True,
     )
+
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(RedactSecretsFilter())
 
     if debug:
         os.environ.setdefault("ANTHROPIC_LOG", "debug")

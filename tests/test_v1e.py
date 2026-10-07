@@ -610,13 +610,24 @@ def test_llm_tool_payload_keeps_decision_fields_and_drops_duplicates():
     }
     fx = agent.compact_tool_result("get_fixtures", fat_fx)
     assert fx["count"] == 2 and len(fx["fixtures"]) == 1
-    row = fx["fixtures"][0]
-    assert row["fixture_id"] == 1 and row["home"]["name"] == "Arsenal"
-    assert row["season"] == 2026 and row["league_id"] == 39
-    assert "score" not in row or row.get("score") is not None
-    assert "status" not in row  # upcoming: destul status_group
+    # [fixture_id, weekday, kickoff, league_id, season, home_id, home, away_id, away]
+    assert fx["fixtures"][0] == [1, "sâmbătă", "2026-10-11 14:30", 39, 2026,
+                                 42, "Arsenal", 63, "Leeds"]
+    assert fx["leagues"] == {"39": "Premier League"}
+    assert fx["row"] == agent.FIXTURE_ROW_FORMAT
     assert "note" not in fx and "matches_per_day" not in fx
     assert "stale_days" not in fx
+
+    finished = dict(fat_fx["fixtures"][0], fixture_id=2, status="FT",
+                    status_group="finished", score="2-1")
+    fx2 = agent.compact_tool_result("get_fixtures", dict(fat_fx, fixtures=[finished]))
+    assert fx2["fixtures"][0][-1] == "FT"  # status doar pentru meciuri care nu sunt upcoming
+
+    big = dict(fat_fx, fixtures=fat_fx["fixtures"] * 40)
+    old_style = json.dumps(big["fixtures"], ensure_ascii=False, separators=(",", ":"))
+    new_style = json.dumps(agent.compact_tool_result("get_fixtures", big)["fixtures"],
+                           ensure_ascii=False, separators=(",", ":"))
+    assert len(new_style) < len(old_style) / 2
 
 
 def test_classic_prompt_batches_research_in_one_step(monkeypatch):
@@ -624,6 +635,29 @@ def test_classic_prompt_batches_research_in_one_step(monkeypatch):
     prompt = prompts.build_system_prompt()
     assert "ONE batch" in prompt
     assert "analyze_matches" not in prompt
+
+
+@pytest.mark.parametrize("mode", ["classic", "analysts"])
+def test_prompt_builds_the_ticket_in_one_call(mode):
+    """Fără reconstruiri pentru «varietate»: fiecare rundă refacturează conversația."""
+    prompt = prompts.build_system_prompt(mode)
+    assert "BUILD THE TICKET IN ONE CALL" in prompt
+    assert "Rebuild AT MOST ONCE" in prompt
+    assert "{_BUILD_ONCE}" not in prompt
+
+
+def test_logs_redact_api_keys_in_urls():
+    import logging
+    from logging_config import RedactSecretsFilter
+
+    record = logging.LogRecord(
+        "httpx", logging.INFO, __file__, 1, 'HTTP Request: %s %s "%s"',
+        ("GET", "https://api.oddspapi.io/v4/odds?apiKey=6c183127-secret&fixtureId=id1",
+         "HTTP/1.1 200 OK"), None)
+    RedactSecretsFilter().filter(record)
+    msg = record.getMessage()
+    assert "6c183127-secret" not in msg
+    assert "apiKey=***" in msg and "fixtureId=id1" in msg
 
 
 def test_prompt_mode_argument_overrides_environment(monkeypatch):
