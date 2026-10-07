@@ -882,6 +882,26 @@ function callsLines(u) {
   return `<span class="calls">${rows}</span>`;
 }
 
+/* Ce date de la tool-uri a citit Sonnet: cât ocupă fiecare (tokeni aproximativi),
+   ca să vedem ce umflă rundele scumpe. */
+function toolsLine(t) {
+  if (!t || !(t.by_tool || []).length) return "";
+  const grouped = t.by_tool.map(g =>
+    `${g.tool}${g.calls > 1 ? " ×" + g.calls : ""} ~${fmtTokens(g.tokens)}`).join(" · ");
+  const rounds = {};
+  (t.calls || []).forEach(c => {
+    const r = rounds[c.round] || (rounds[c.round] = {tokens: 0, items: []});
+    r.tokens += c.tokens;
+    const args = c.args ? " (" + DOMPurify.sanitize(String(c.args), {ALLOWED_TAGS: []}) + ")" : "";
+    r.items.push(`${c.tool}${args} ~${fmtTokens(c.tokens)}`);
+  });
+  const perRound = Object.keys(rounds).sort((a, b) => a - b).map(r =>
+    `<span class="call">intră în runda ${r} · ~${fmtTokens(rounds[r].tokens)}: ` +
+    `${rounds[r].items.join(", ")}</span>`).join("");
+  return `<span class="calls"><b>Date trimise lui Sonnet:</b> ~${fmtTokens(t.total_tokens || 0)} — ` +
+         `${grouped}${perRound}</span>`;
+}
+
 function whyLine(u) {
   if (modeLabel(u.mode) !== "simplu") return "";
   const coord = (u.by_role || []).find(r => r.role === "coordinator");
@@ -919,7 +939,7 @@ function showCost(u, bubble) {
     : "";
   const timeBit = time ? `<b>răspuns ${time}</b>` : "";
   box.innerHTML = [timeBit, costBit].filter(Boolean).join(" · ") +
-    modeLine(u) + callsLines(u) + whyLine(u) + apiLine(u.api);
+    modeLine(u) + callsLines(u) + toolsLine(u.tools) + whyLine(u) + apiLine(u.api);
   const tip = [];
   (u.by_role || []).forEach(r => tip.push(`${roleLabel(r.role)}: ${r.calls} apeluri, $${r.cost_usd.toFixed(4)}`));
   (u.models || []).forEach(m => tip.push(`${m.model}: ${m.calls} apeluri, $${m.cost_usd.toFixed(4)}`));

@@ -336,6 +336,12 @@ async def test_turn_cost_includes_history_and_is_exposed_to_dev_mode(no_http, mo
     assert all(c["role"] == "coordinator" for c in usage[0]["calls_detail"])
     assert usage[0]["calls_detail"][0]["label"]
     assert {r["role"] for r in usage[0]["by_role"]} == {"coordinator"}
+    # Ce date de tool-uri a citit Sonnet: get_fixtures, intrat în runda 2.
+    tools = usage[0]["tools"]
+    assert [t["tool"] for t in tools["by_tool"]] == ["get_fixtures"]
+    assert tools["calls"][0]["round"] == 2
+    assert tools["calls"][0]["tokens"] >= 1
+    assert api["tools"] == tools
 
 
 async def test_dev_mode_latency_tracks_wall_clock(no_http, monkeypatch):

@@ -18,7 +18,7 @@ import os
 import time
 import uuid
 import asyncio
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from typing import Any, AsyncGenerator, Optional
 
 from anthropic import AsyncAnthropic, APIStatusError
@@ -811,6 +811,50 @@ def compact_tool_result(name: str, result: Any) -> Any:
     return result
 
 
+# Cat ocupa fiecare tool_result trimis lui Sonnet, per tura (modul dezvoltator).
+# In memorie, ca statisticile API-Football: dupa restart se pierde, e doar diagnostic.
+_MAX_TRACKED_TURNS = 50
+_turn_tool_sizes: "OrderedDict[str, list[dict]]" = OrderedDict()
+
+
+def _approx_tokens(chars: int) -> int:
+    return max(1, round(chars / 3))
+
+
+def _args_summary(args: dict) -> str:
+    keys = ("fixture_id", "team_id", "team1_id", "team2_id", "league_id",
+            "date_from", "date_to", "name", "search", "search_or_id")
+    bits = [f"{k}={args[k]}" for k in keys if args.get(k) is not None]
+    if args.get("candidates"):
+        bits.append(f"candidates={len(args['candidates'])}")
+    return ", ".join(bits)[:80]
+
+
+def _record_tool_size(turn_id: Optional[str], sent_in_round: int, name: str,
+                      args: dict, chars: int) -> None:
+    if not turn_id:
+        return
+    rows = _turn_tool_sizes.setdefault(turn_id, [])
+    rows.append({"round": sent_in_round, "tool": name, "args": _args_summary(args or {}),
+                 "chars": chars, "tokens": _approx_tokens(chars)})
+    _turn_tool_sizes.move_to_end(turn_id)
+    while len(_turn_tool_sizes) > _MAX_TRACKED_TURNS:
+        _turn_tool_sizes.popitem(last=False)
+
+
+def turn_tool_sizes(turn_id: str) -> dict:
+    """Ce date de tool-uri a citit Sonnet in tura, grupat pe tool (tokeni ~ chars/3)."""
+    rows = list(_turn_tool_sizes.get(turn_id) or [])
+    by_tool: dict[str, dict] = {}
+    for r in rows:
+        t = by_tool.setdefault(r["tool"], {"tool": r["tool"], "calls": 0, "chars": 0, "tokens": 0})
+        t["calls"] += 1
+        t["chars"] += r["chars"]
+        t["tokens"] += r["tokens"]
+    grouped = sorted(by_tool.values(), key=lambda t: t["tokens"], reverse=True)
+    return {"total_tokens": sum(r["tokens"] for r in rows), "by_tool": grouped, "calls": rows}
+
+
 def _tool_result_json(name: str, result: Any) -> str:
     raw = json.dumps(result, ensure_ascii=False, default=str, separators=(",", ":"))
     payload = _omit_none(compact_tool_result(name, result))
@@ -1318,10 +1362,15 @@ async def run_turn(messages: list[dict],
                              for s in last_ticket_selections if s.get("bookmaker_link")]
                     if links:
                         yield {"type": "ticket_links", "selections": links}
+                content = _tool_result_json(block.name, result)
+                _record_tool_size(turn_id, iteration + 2, block.name, block.input or {}, len(content))
+                log.info("Tool result size turn=%s round=%d tool=%s chars=%d ~tokens=%d args=%s",
+                         turn_id, iteration + 2, block.name, len(content),
+                         _approx_tokens(len(content)), _args_summary(block.input or {}))
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
-                    "content": _tool_result_json(block.name, result),
+                    "content": content,
                 })
             messages.append({"role": "user", "content": tool_results})
             yield {"type": "status", "label": _after_tools_status([b.name for b in tool_blocks])}

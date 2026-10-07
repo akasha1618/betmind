@@ -447,6 +447,7 @@ async def _produce_turn(turn: turns.Turn, history: list[dict], start_len: int,
                 **summary,
                 "mode": turn_mode or summary.get("mode"),
                 "api": fd.turn_api_stats(turn_id),
+                "tools": agent.turn_tool_sizes(turn_id),
                 "latency_s": latency_s,
             })
     except asyncio.CancelledError:
@@ -625,6 +626,7 @@ async def usage(turn_id: str):
     return {"turn_id": turn_id, **summary,
             "mode": await db.turn_mode(turn_id) or summary.get("mode"),
             "api": fd.turn_api_stats(turn_id),
+            "tools": agent.turn_tool_sizes(turn_id),
             "latency_s": await db.turn_latency(turn_id)}
 
 
