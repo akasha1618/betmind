@@ -283,8 +283,10 @@ TOOLS: list[dict] = [
         "name": "get_odds",
         "description": ("Cotele pre-match pentru un meci, agregate pe toate casele: "
                         "1X2, sansa dubla, over/under, GG, handicap asiatic, totaluri de echipa, "
-                        "piete de pauza etc. Foloseste avg_odd / best_odd / n_books; "
-                        "cheile legacy 1X2/over_under/btts/double_chance raman."),
+                        "piete de pauza etc. Format compact: markets[cheie].o[varianta] = "
+                        "[avg_odd, display_odd] sau [avg_odd, display_odd, best_odd]; "
+                        "markets[cheie].n = cate case. In build_ticket: odds = display_odd, "
+                        "avg_odds = avg_odd (pentru probabilitatea implicita)."),
         "input_schema": {
             "type": "object",
             "properties": {"fixture_id": {"type": "integer"}},
@@ -708,40 +710,43 @@ def _omit_none(value: Any) -> Any:
     return value
 
 
-def _compact_odds_for_llm(odds: dict) -> dict:
-    """Aceleasi piete si cote, fara duplicate (odds_label, name, legacy).
+ODDS_ROW_FORMAT = "[avg_odd, display_odd] sau [avg_odd, display_odd, best_odd]"
 
-    Coordinatorul are nevoie de avg_odd (probabilitate), display_odd (ce
-    aratam userului) si best_odd doar cand e semnificativ diferit. Restul
-    se reconstruiește la nevoie; analiștii primesc în continuare pachetul
-    complet din get_odds(), nu copia din tool_result.
+
+def _odds_row(o: dict) -> list:
+    avg, display, best = o.get("avg_odd"), o.get("display_odd"), o.get("best_odd")
+    if display is None:
+        display = avg
+    row = [avg, display]
+    try:
+        if best is not None and display is not None and abs(float(best) - float(display)) >= 0.05:
+            row.append(best)
+    except (TypeError, ValueError):
+        pass
+    return row
+
+
+def _compact_odds_for_llm(odds: dict) -> dict:
+    """Toate pietele si cotele, ca tabel: markets[key] = {n, o: {value: row}}.
+
+    Fiecare varianta repeta altfel 5 chei JSON (~3.5k tokeni/meci, x8 meciuri
+    la runda 3). display_bookmaker nu ajunge la model: nu are voie sa numeasca
+    case, iar cota/linkul Superbet le pune codul dupa build_ticket. Analistii
+    primesc in continuare pachetul complet din get_odds().
     """
     if odds.get("error") and not odds.get("markets"):
         return dict(odds)
-    markets = []
+    markets: dict[str, Any] = {}
     for m in odds.get("markets") or []:
-        outcomes = []
-        for o in m.get("outcomes") or []:
-            row: dict[str, Any] = {
-                "value": o.get("value"),
-                "avg_odd": o.get("avg_odd"),
-                "display_odd": o.get("display_odd"),
-            }
-            if o.get("n_books"):
-                row["n_books"] = o["n_books"]
-            display = o.get("display_odd")
-            best = o.get("best_odd")
-            try:
-                if best is not None and display is not None and abs(float(best) - float(display)) >= 0.05:
-                    row["best_odd"] = best
-            except (TypeError, ValueError):
-                if best is not None:
-                    row["best_odd"] = best
-            if o.get("display_bookmaker"):
-                row["display_bookmaker"] = o["display_bookmaker"]
-            outcomes.append(row)
-        markets.append({"key": m.get("key"), "outcomes": outcomes})
-    out: dict[str, Any] = {"markets": markets}
+        rows = {str(o.get("value")): _odds_row(o) for o in m.get("outcomes") or []}
+        if not rows:
+            continue
+        entry: dict[str, Any] = {"o": rows}
+        books = [o.get("n_books") for o in m.get("outcomes") or [] if o.get("n_books")]
+        if books:
+            entry["n"] = max(books)
+        markets[str(m.get("key"))] = entry
+    out: dict[str, Any] = {"row": ODDS_ROW_FORMAT, "markets": markets}
     if odds.get("truncated"):
         out["truncated"] = True
     if odds.get("error"):
