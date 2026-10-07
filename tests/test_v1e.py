@@ -320,6 +320,18 @@ async def test_turn_cost_includes_history_and_is_exposed_to_dev_mode(no_http, mo
         assert usage[0]["turn_id"] == turn_id
 
         api = (await client.get(f"/api/usage/{turn_id}")).json()
+        sent = (await client.get(f"/api/usage/{turn_id}/payload/0")).json()
+        system = (await client.get(f"/api/usage/{turn_id}/payload/system")).json()
+        missing = await client.get(f"/api/usage/{turn_id}/payload/9")
+
+    # Dev mode poate deschide exact ce a primit Sonnet ca tool_result.
+    assert sent["tool"] == "get_fixtures"
+    assert sent["content"] == agent._tool_result_json("get_fixtures", {"ok": True})
+    assert sent["full_args"] == {"date": "2026-08-23"}
+    assert system["content"] == agent.build_system_prompt(api["mode"])
+    assert missing.status_code == 404
+    assert "content" not in usage[0]["tools"]["calls"][0]
+    assert usage[0]["tools"]["prefix"]["system"]["tokens"] > 100
 
     # Doua apeluri catre model in aceeasi tura, un singur cost raportat.
     assert usage[0]["calls"] == 2
@@ -583,6 +595,8 @@ def test_llm_tool_payload_keeps_decision_fields_and_drops_duplicates():
                  "Match Winner", "best_bookmaker"):
         assert gone not in dumped
     assert len(dumped) < len(json.dumps(fat_odds, ensure_ascii=False)) / 2
+    sections = agent._sections_breakdown("get_odds", dumped)
+    assert [s["key"] for s in sections] == ["1x2"] and sections[0]["outcomes"] == 1
 
     close = {"markets": [{"key": "btts", "outcomes": [
         {"value": "Yes", "avg_odd": 1.80, "display_odd": 1.83, "best_odd": 1.85}]}]}

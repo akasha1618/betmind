@@ -630,6 +630,16 @@ async def usage(turn_id: str):
             "latency_s": await db.turn_latency(turn_id)}
 
 
+@app.get("/api/usage/{turn_id}/payload/{key}")
+async def usage_payload(turn_id: str, key: str):
+    """Textul exact trimis lui Sonnet în tură: un rezultat de tool (index) sau
+    partea fixă ('system' / 'tools'). Doar în memorie, se pierde la restart."""
+    data = agent.turn_tool_payload(turn_id, key)
+    if data is None:
+        raise HTTPException(404, "Nu mai am conținutul (server repornit sau tură veche).")
+    return data
+
+
 @app.post("/api/feedback")
 async def feedback(req: FeedbackRequest):
     row = await db.upsert_feedback(

@@ -222,6 +222,19 @@
   .devcost .call b{color:var(--text); font-weight:600}
   .devcost .why{display:block; margin-top:6px; color:var(--amber); font-size:11px; line-height:1.4}
   /* a doua linie: ce s-a intamplat cu API-Football in tura curenta */
+  .devcost a.peek{color:var(--text); text-decoration:underline dotted; cursor:pointer}
+  .devcost .hint{font-style:normal; opacity:.7}
+  .devcost .peekbox{display:block; margin-top:8px; padding:8px; border:1px solid var(--line);
+    border-radius:8px; background:rgba(0,0,0,.25); max-width:100%}
+  .devcost .peekhead{display:flex; justify-content:space-between; gap:8px; color:var(--text)}
+  .devcost .peekclose{background:none; border:1px solid var(--line); color:var(--muted);
+    border-radius:6px; font-size:11px; cursor:pointer}
+  .devcost .peekargs{margin-top:4px; word-break:break-all}
+  .devcost .peeksec{margin-top:6px; border-collapse:collapse; font-size:11px}
+  .devcost .peeksec th,.devcost .peeksec td{padding:1px 8px 1px 0; text-align:left}
+  .devcost .peekpre{margin-top:6px; max-height:360px; overflow:auto; white-space:pre-wrap;
+    word-break:break-all; font-size:10.5px; color:var(--text)}
+  .devcost .peeknote{margin-top:4px; font-size:10.5px; opacity:.7}
   .devcost .api{display:block; margin-top:5px; padding-top:5px; border-top:1px dashed var(--line)}
   .devcost .api .bad{color:var(--danger)}
   .devcost .api .good{color:var(--green)}
@@ -884,7 +897,11 @@ function callsLines(u) {
 
 /* Ce date de la tool-uri a citit Sonnet: cât ocupă fiecare (tokeni aproximativi),
    ca să vedem ce umflă rundele scumpe. */
-function toolsLine(t) {
+function peekLink(turnId, key, text) {
+  return `<a href="#" class="peek" data-turn="${encodeURIComponent(turnId)}" data-key="${key}">${text}</a>`;
+}
+
+function toolsLine(t, turnId) {
   if (!t || !(t.by_tool || []).length) return "";
   const grouped = t.by_tool.map(g =>
     `${g.tool}${g.calls > 1 ? " ×" + g.calls : ""} ~${fmtTokens(g.tokens)}`).join(" · ");
@@ -893,13 +910,80 @@ function toolsLine(t) {
     const r = rounds[c.round] || (rounds[c.round] = {tokens: 0, items: []});
     r.tokens += c.tokens;
     const args = c.args ? " (" + DOMPurify.sanitize(String(c.args), {ALLOWED_TAGS: []}) + ")" : "";
-    r.items.push(`${c.tool}${args} ~${fmtTokens(c.tokens)}`);
+    const label = `${c.tool}${args} ~${fmtTokens(c.tokens)}`;
+    r.items.push(c.idx != null && turnId ? peekLink(turnId, c.idx, label) : label);
   });
   const perRound = Object.keys(rounds).sort((a, b) => a - b).map(r =>
     `<span class="call">intră în runda ${r} · ~${fmtTokens(rounds[r].tokens)}: ` +
     `${rounds[r].items.join(", ")}</span>`).join("");
+  let prefix = "";
+  if (t.prefix && turnId) {
+    prefix = `<span class="call">fix la fiecare rundă: ` +
+      peekLink(turnId, "system", `prompt sistem ~${fmtTokens(t.prefix.system.tokens)}`) + " · " +
+      peekLink(turnId, "tools", `definiții tool-uri ~${fmtTokens(t.prefix.tools.tokens)}`) + `</span>`;
+  }
   return `<span class="calls"><b>Date trimise lui Sonnet:</b> ~${fmtTokens(t.total_tokens || 0)} — ` +
-         `${grouped}${perRound}</span>`;
+         `${grouped} <i class="hint">(click pe un tool ca să vezi exact ce s-a trimis)</i>` +
+         `${prefix}${perRound}</span>`;
+}
+
+/* Conținutul exact al unui tool_result, cu defalcare pe secțiuni (piețe la cote). */
+async function openPeek(a) {
+  const box = a.closest(".devcost");
+  const key = a.dataset.key;
+  let panel = box.querySelector(".peekbox");
+  if (panel && panel.dataset.key === key) { panel.remove(); return; }
+  if (!panel) { panel = el("div", "peekbox"); box.appendChild(panel); }
+  panel.dataset.key = key;
+  panel.textContent = "Se încarcă…";
+  let d;
+  try {
+    const r = await fetch(`/api/usage/${a.dataset.turn}/payload/${encodeURIComponent(key)}`);
+    d = await r.json();
+    if (!r.ok) throw new Error(d.detail || r.status);
+  } catch (e) {
+    panel.textContent = "Nu pot încărca conținutul: " + e.message;
+    return;
+  }
+  panel.textContent = "";
+  const head = el("div", "peekhead");
+  const bits = [`${d.tool}${d.round ? " · intră în runda " + d.round : ""}`,
+                `${d.chars.toLocaleString("ro-RO")} caractere ≈ ${fmtTokens(d.tokens)} tokeni estimați`];
+  if (d.raw_chars && d.raw_chars > d.chars)
+    bits.push(`înainte de compactare: ${d.raw_chars.toLocaleString("ro-RO")} caractere`);
+  head.textContent = bits.join(" · ");
+  const close = el("button", "peekclose");
+  close.type = "button";
+  close.textContent = "închide";
+  close.onclick = () => panel.remove();
+  head.appendChild(close);
+  panel.appendChild(head);
+  if (d.full_args && Object.keys(d.full_args).length) {
+    const args = el("div", "peekargs");
+    args.textContent = "argumente: " + JSON.stringify(d.full_args);
+    panel.appendChild(args);
+  }
+  if ((d.sections || []).length) {
+    const tbl = el("table", "peeksec");
+    const total = d.sections.reduce((s, x) => s + x.chars, 0) || 1;
+    const hdr = tbl.insertRow();
+    [d.tool === "get_odds" ? "piață" : "cheie", "tokeni ~", "%", d.tool === "get_odds" ? "variante" : ""]
+      .forEach(t => { const th = el("th"); th.textContent = t; hdr.appendChild(th); });
+    d.sections.forEach(s => {
+      const row = tbl.insertRow();
+      [s.key, fmtTokens(s.tokens), Math.round(100 * s.chars / total) + "%", s.outcomes ?? ""]
+        .forEach(v => { row.insertCell().textContent = v; });
+    });
+    panel.appendChild(tbl);
+  }
+  const pre = el("pre", "peekpre");
+  let text = d.content || "";
+  try { text = JSON.stringify(JSON.parse(text), null, 1); } catch (e) {}
+  pre.textContent = text;
+  panel.appendChild(pre);
+  const note = el("div", "peeknote");
+  note.textContent = "Afișat formatat ca să se citească; lui Sonnet i se trimite compact, fără spații.";
+  panel.appendChild(note);
 }
 
 function whyLine(u) {
@@ -938,8 +1022,10 @@ function showCost(u, bubble) {
       `${u.calls || 0} apeluri${u.prices_exact === false ? " (preț aproximativ)" : ""}`
     : "";
   const timeBit = time ? `<b>răspuns ${time}</b>` : "";
+  const openPanel = box.querySelector(".peekbox");
   box.innerHTML = [timeBit, costBit].filter(Boolean).join(" · ") +
-    modeLine(u) + callsLines(u) + toolsLine(u.tools) + whyLine(u) + apiLine(u.api);
+    modeLine(u) + callsLines(u) + toolsLine(u.tools, u.turn_id) + whyLine(u) + apiLine(u.api);
+  if (openPanel) box.appendChild(openPanel);
   const tip = [];
   (u.by_role || []).forEach(r => tip.push(`${roleLabel(r.role)}: ${r.calls} apeluri, $${r.cost_usd.toFixed(4)}`));
   (u.models || []).forEach(m => tip.push(`${m.model}: ${m.calls} apeluri, $${m.cost_usd.toFixed(4)}`));
@@ -1158,6 +1244,12 @@ sendBtn.addEventListener("click", e => {
   if (streaming) { e.preventDefault(); stopStreaming(); }
 });
 thread.addEventListener("click", e => { const c = e.target.closest(".chip"); if (c) send(c.textContent); });
+thread.addEventListener("click", e => {
+  const a = e.target.closest("a.peek");
+  if (!a) return;
+  e.preventDefault();
+  openPeek(a);
+});
 </script>
 </body>
 </html>

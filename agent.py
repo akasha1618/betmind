@@ -842,20 +842,36 @@ def _args_summary(args: dict) -> str:
 
 
 def _record_tool_size(turn_id: Optional[str], sent_in_round: int, name: str,
-                      args: dict, chars: int) -> None:
+                      args: dict, chars: int, content: Optional[str] = None,
+                      raw_chars: Optional[int] = None) -> None:
     if not turn_id:
         return
     rows = _turn_tool_sizes.setdefault(turn_id, [])
-    rows.append({"round": sent_in_round, "tool": name, "args": _args_summary(args or {}),
-                 "chars": chars, "tokens": _approx_tokens(chars)})
+    rows.append({"idx": len(rows), "round": sent_in_round, "tool": name,
+                 "args": _args_summary(args or {}), "full_args": dict(args or {}),
+                 "chars": chars, "tokens": _approx_tokens(chars),
+                 "raw_chars": raw_chars, "content": content})
     _turn_tool_sizes.move_to_end(turn_id)
     while len(_turn_tool_sizes) > _MAX_TRACKED_TURNS:
         _turn_tool_sizes.popitem(last=False)
 
 
+_turn_prefix: "OrderedDict[str, dict]" = OrderedDict()
+
+
+def _record_turn_prefix(turn_id: str, system_prompt: str, tools: list[dict]) -> None:
+    """Partea fixă pe care Sonnet o primește la fiecare rundă: prompt + definiții tool-uri."""
+    tools_json = json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
+    _turn_prefix[turn_id] = {"system": system_prompt, "tools": tools_json}
+    _turn_prefix.move_to_end(turn_id)
+    while len(_turn_prefix) > _MAX_TRACKED_TURNS:
+        _turn_prefix.popitem(last=False)
+
+
 def turn_tool_sizes(turn_id: str) -> dict:
     """Ce date de tool-uri a citit Sonnet in tura, grupat pe tool (tokeni ~ chars/3)."""
-    rows = list(_turn_tool_sizes.get(turn_id) or [])
+    rows = [{k: v for k, v in r.items() if k not in ("content", "full_args")}
+            for r in _turn_tool_sizes.get(turn_id) or []]
     by_tool: dict[str, dict] = {}
     for r in rows:
         t = by_tool.setdefault(r["tool"], {"tool": r["tool"], "calls": 0, "chars": 0, "tokens": 0})
@@ -863,16 +879,65 @@ def turn_tool_sizes(turn_id: str) -> dict:
         t["chars"] += r["chars"]
         t["tokens"] += r["tokens"]
     grouped = sorted(by_tool.values(), key=lambda t: t["tokens"], reverse=True)
-    return {"total_tokens": sum(r["tokens"] for r in rows), "by_tool": grouped, "calls": rows}
+    out = {"total_tokens": sum(r["tokens"] for r in rows), "by_tool": grouped, "calls": rows}
+    prefix = _turn_prefix.get(turn_id)
+    if prefix:
+        out["prefix"] = {k: {"chars": len(v), "tokens": _approx_tokens(len(v))}
+                         for k, v in prefix.items()}
+    return out
 
 
-def _tool_result_json(name: str, result: Any) -> str:
+def _sections_breakdown(name: str, content: str) -> list[dict]:
+    """Din ce e făcut payload-ul: pentru get_odds pe piețe, altfel pe chei de top."""
+    try:
+        data = json.loads(content)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    parts = data.get("markets") if name == "get_odds" and isinstance(data.get("markets"), dict) else data
+    out = []
+    for key, value in parts.items():
+        chars = len(json.dumps(value, ensure_ascii=False, separators=(",", ":"))) + len(key) + 4
+        item = {"key": key, "chars": chars, "tokens": _approx_tokens(chars)}
+        if name == "get_odds" and isinstance(value, dict) and isinstance(value.get("o"), dict):
+            item["outcomes"] = len(value["o"])
+        out.append(item)
+    return sorted(out, key=lambda s: s["chars"], reverse=True)
+
+
+def turn_tool_payload(turn_id: str, key: str) -> Optional[dict]:
+    """Conținutul exact trimis lui Sonnet (modul dezvoltator): un tool_result după
+    index, sau partea fixă 'system' / 'tools'."""
+    if key in ("system", "tools"):
+        content = (_turn_prefix.get(turn_id) or {}).get(key)
+        if content is None:
+            return None
+        return {"tool": key, "chars": len(content), "tokens": _approx_tokens(len(content)),
+                "content": content, "sections": []}
+    try:
+        idx = int(key)
+    except ValueError:
+        return None
+    rows = _turn_tool_sizes.get(turn_id) or []
+    if not 0 <= idx < len(rows):
+        return None
+    r = rows[idx]
+    content = r.get("content") or ""
+    return {**r, "sections": _sections_breakdown(r["tool"], content)}
+
+
+def _tool_result_payload(name: str, result: Any) -> tuple[str, int]:
     raw = json.dumps(result, ensure_ascii=False, default=str, separators=(",", ":"))
     payload = _omit_none(compact_tool_result(name, result))
     compact = json.dumps(payload, ensure_ascii=False, default=str, separators=(",", ":"))
     if len(compact) + 200 < len(raw):
         log.info("Tool result %s compacted %d -> %d chars", name, len(raw), len(compact))
-    return compact
+    return compact, len(raw)
+
+
+def _tool_result_json(name: str, result: Any) -> str:
+    return _tool_result_payload(name, result)[0]
 
 
 async def _execute_tool(name: str, args: dict[str, Any],
@@ -1183,6 +1248,7 @@ async def run_turn(messages: list[dict],
         base_url, api_key[:12],
     )
     turn_id = turn_id or uuid.uuid4().hex
+    _record_turn_prefix(turn_id, system_prompt, tools)
     continues = 0
     last_ticket_selections: list = []
     analyzed_fixture_ids: list[int] = []
@@ -1373,8 +1439,9 @@ async def run_turn(messages: list[dict],
                              for s in last_ticket_selections if s.get("bookmaker_link")]
                     if links:
                         yield {"type": "ticket_links", "selections": links}
-                content = _tool_result_json(block.name, result)
-                _record_tool_size(turn_id, iteration + 2, block.name, block.input or {}, len(content))
+                content, raw_chars = _tool_result_payload(block.name, result)
+                _record_tool_size(turn_id, iteration + 2, block.name, block.input or {},
+                                  len(content), content=content, raw_chars=raw_chars)
                 log.info("Tool result size turn=%s round=%d tool=%s chars=%d ~tokens=%d args=%s",
                          turn_id, iteration + 2, block.name, len(content),
                          _approx_tokens(len(content)), _args_summary(block.input or {}))
