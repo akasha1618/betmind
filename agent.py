@@ -699,6 +699,122 @@ def _latest_user_text(messages: list[dict]) -> str:
     return ""
 
 
+def _omit_none(value: Any) -> Any:
+    """Scoate None din dict-uri (tokeni morti in prompt). 0/False raman."""
+    if isinstance(value, dict):
+        return {k: _omit_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_omit_none(v) for v in value]
+    return value
+
+
+def _compact_odds_for_llm(odds: dict) -> dict:
+    """Aceleasi piete si cote, fara duplicate (odds_label, name, legacy).
+
+    Coordinatorul are nevoie de avg_odd (probabilitate), display_odd (ce
+    aratam userului) si best_odd doar cand e semnificativ diferit. Restul
+    se reconstruiește la nevoie; analiștii primesc în continuare pachetul
+    complet din get_odds(), nu copia din tool_result.
+    """
+    if odds.get("error") and not odds.get("markets"):
+        return dict(odds)
+    markets = []
+    for m in odds.get("markets") or []:
+        outcomes = []
+        for o in m.get("outcomes") or []:
+            row: dict[str, Any] = {
+                "value": o.get("value"),
+                "avg_odd": o.get("avg_odd"),
+                "display_odd": o.get("display_odd"),
+            }
+            if o.get("n_books"):
+                row["n_books"] = o["n_books"]
+            display = o.get("display_odd")
+            best = o.get("best_odd")
+            try:
+                if best is not None and display is not None and abs(float(best) - float(display)) >= 0.05:
+                    row["best_odd"] = best
+            except (TypeError, ValueError):
+                if best is not None:
+                    row["best_odd"] = best
+            if o.get("display_bookmaker"):
+                row["display_bookmaker"] = o["display_bookmaker"]
+            outcomes.append(row)
+        markets.append({"key": m.get("key"), "outcomes": outcomes})
+    out: dict[str, Any] = {"markets": markets}
+    if odds.get("truncated"):
+        out["truncated"] = True
+    if odds.get("error"):
+        out["error"] = odds["error"]
+    if odds.get("warning"):
+        out["warning"] = odds["warning"]
+    if not markets:
+        for key in ("bookmaker", "1X2", "over_under", "btts", "double_chance"):
+            if key in odds:
+                out[key] = odds[key]
+    return out
+
+
+def _compact_fixtures_for_llm(result: dict) -> dict:
+    """Lista de meciuri rămâne completă (același shortlist), fără meta inutilă."""
+    fixtures = []
+    for f in result.get("fixtures") or []:
+        row = {
+            "fixture_id": f.get("fixture_id"),
+            "date": f.get("date"),
+            "weekday": f.get("weekday"),
+            "time": f.get("time"),
+            "kickoff": f.get("kickoff"),
+            "status_group": f.get("status_group"),
+            "league": f.get("league"),
+            "league_id": f.get("league_id"),
+            "season": f.get("season"),
+            "home": f.get("home"),
+            "away": f.get("away"),
+        }
+        if f.get("status_group") != "upcoming" and f.get("status"):
+            row["status"] = f["status"]
+        fixtures.append(row)
+    out: dict[str, Any] = {
+        "count": result.get("count"),
+        "listed": result.get("listed"),
+        "by_league": result.get("by_league"),
+        "source": result.get("source"),
+        "fixtures": fixtures,
+    }
+    if result.get("truncated"):
+        out["truncated"] = True
+        out["note"] = result.get("note")
+    if result.get("budget_exhausted"):
+        out["budget_exhausted"] = True
+        out["note"] = "Buget API epuizat; datele pot fi vechi."
+    stale = [d for d, meta in (result.get("days") or {}).items()
+             if isinstance(meta, dict) and meta.get("stale")]
+    if stale:
+        out["stale_days"] = stale
+    return out
+
+
+def compact_tool_result(name: str, result: Any) -> Any:
+    """Payload-ul pe care îl revede Sonnet. Nu schimbă datele de decizie."""
+    if not isinstance(result, dict):
+        return result
+    if name == "get_fixtures":
+        return _compact_fixtures_for_llm(result)
+    if name == "get_odds":
+        return _compact_odds_for_llm(result)
+    return result
+
+
+def _tool_result_json(name: str, result: Any) -> str:
+    raw = json.dumps(result, ensure_ascii=False, default=str, separators=(",", ":"))
+    payload = _omit_none(compact_tool_result(name, result))
+    compact = json.dumps(payload, ensure_ascii=False, default=str, separators=(",", ":"))
+    if len(compact) + 200 < len(raw):
+        log.info("Tool result %s compacted %d -> %d chars", name, len(raw), len(compact))
+    return compact
+
+
 async def _execute_tool(name: str, args: dict[str, Any],
                         conversation_id: str | None = None,
                         user_key: str | None = None,
@@ -1161,7 +1277,7 @@ async def run_turn(messages: list[dict],
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
-                    "content": json.dumps(result, ensure_ascii=False, default=str),
+                    "content": _tool_result_json(block.name, result),
                 })
             messages.append({"role": "user", "content": tool_results})
             yield {"type": "status", "label": _after_tools_status([b.name for b in tool_blocks])}

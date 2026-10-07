@@ -545,6 +545,78 @@ def test_prompt_forbids_dev_jargon_but_keeps_emoji(monkeypatch, mode):
     assert "MARKDOWN HYGIENE" in prompt
 
 
+def test_llm_tool_payload_keeps_decision_fields_and_drops_duplicates():
+    """Sonnet vede aceleași meciuri/cote, fără duplicate care umflă cache-ul."""
+    fat_odds = {
+        "bookmaker": "Bet365",
+        "1X2": {"Home": 1.80},
+        "over_under": {"Over 2.5": 1.90},
+        "btts": {"Yes": 1.85},
+        "double_chance": {"Home/Draw": 1.25},
+        "markets": [{
+            "key": "1x2",
+            "name": "Match Winner",
+            "outcomes": [{
+                "value": "Home", "avg_odd": 1.82, "best_odd": 1.90,
+                "n_books": 6, "reference_odd": 1.80, "display_odd": 1.70,
+                "best_bookmaker": "Unibet", "display_bookmaker": "Superbet",
+                "odds_label": "1.70",
+            }],
+        }],
+        "truncated": False,
+    }
+    slim = agent.compact_tool_result("get_odds", fat_odds)
+    home = slim["markets"][0]["outcomes"][0]
+    assert home["avg_odd"] == 1.82 and home["display_odd"] == 1.70
+    assert home["display_bookmaker"] == "Superbet"
+    assert home["n_books"] == 6
+    assert home["best_odd"] == 1.90  # gap ≥ 0.05 față de display — rămâne
+    assert "odds_label" not in home
+    assert "reference_odd" not in home
+    assert "name" not in slim["markets"][0]
+    assert "1X2" not in slim  # legacy e duplicat față de markets
+    dumped = agent._tool_result_json("get_odds", fat_odds)
+    assert "odds_label" not in dumped
+    assert len(dumped) < len(json.dumps(fat_odds, ensure_ascii=False))
+
+    fat_fx = {
+        "count": 2, "listed": 2, "by_league": {"PL (id 39)": 2},
+        "source": "local_db",
+        "timezone": "Europe/Bucharest",
+        "matches_per_day": {"2026-10-11": 2},
+        "api_requests_remaining_today": 42,
+        "note": "Toate datele si orele sunt LOCALE Romania " * 8,
+        "days": {"2026-10-11": {"source": "local_db", "stale": False,
+                                "last_synced_at": "2026-10-07T12:00:00"}},
+        "fixtures": [{
+            "fixture_id": 1, "date": "2026-10-11", "weekday": "sâmbătă",
+            "time": "14:30", "kickoff": "2026-10-11T14:30:00+03:00",
+            "status": "NS", "status_group": "upcoming",
+            "league": "Premier League", "league_id": 39, "season": 2026,
+            "round": "Regular Season - 8",
+            "home": {"id": 42, "name": "Arsenal"},
+            "away": {"id": 63, "name": "Leeds"},
+            "score": None,
+        }],
+    }
+    fx = agent.compact_tool_result("get_fixtures", fat_fx)
+    assert fx["count"] == 2 and len(fx["fixtures"]) == 1
+    row = fx["fixtures"][0]
+    assert row["fixture_id"] == 1 and row["home"]["name"] == "Arsenal"
+    assert row["season"] == 2026 and row["league_id"] == 39
+    assert "score" not in row or row.get("score") is not None
+    assert "status" not in row  # upcoming: destul status_group
+    assert "note" not in fx and "matches_per_day" not in fx
+    assert "stale_days" not in fx
+
+
+def test_classic_prompt_batches_research_in_one_step(monkeypatch):
+    monkeypatch.setenv("ORCHESTRATION_MODE", "classic")
+    prompt = prompts.build_system_prompt()
+    assert "ONE batch" in prompt
+    assert "analyze_matches" not in prompt
+
+
 def test_prompt_mode_argument_overrides_environment(monkeypatch):
     monkeypatch.setenv("ORCHESTRATION_MODE", "classic")
     assert "analyze_matches" in prompts.build_system_prompt("analysts")
