@@ -216,6 +216,11 @@
     font-family:"JetBrains Mono",monospace; background:var(--surface-2);
     border:1px dashed var(--line); border-radius:9px; padding:6px 10px}
   .devcost b{color:var(--amber)}
+  .devcost .mode{display:block; margin-top:5px}
+  .devcost .calls{display:block; margin-top:6px; padding-top:5px; border-top:1px dashed var(--line)}
+  .devcost .call{display:block; margin-top:3px; line-height:1.4}
+  .devcost .call b{color:var(--text); font-weight:600}
+  .devcost .why{display:block; margin-top:6px; color:var(--amber); font-size:11px; line-height:1.4}
   /* a doua linie: ce s-a intamplat cu API-Football in tura curenta */
   .devcost .api{display:block; margin-top:5px; padding-top:5px; border-top:1px dashed var(--line)}
   .devcost .api .bad{color:var(--danger)}
@@ -829,6 +834,63 @@ function bubbleOfTurn(turnId) {
   return same.pop() || [...thread.querySelectorAll(".msg.bot")].pop();
 }
 
+function modeLabel(mode) {
+  if (mode === "classic" || mode === "standard") return "simplu";
+  if (mode === "analysts" || mode === "advanced") return "avansat";
+  return mode || "";
+}
+
+function roleLabel(role) {
+  return ({coordinator: "coordinator", analyst: "analist", title: "titlu"})[role] || role || "?";
+}
+
+function shortModel(name) {
+  const n = String(name || "");
+  if (n.includes("opus")) return "Opus";
+  if (n.includes("sonnet")) return "Sonnet";
+  if (n.includes("haiku")) return "Haiku";
+  return n || "?";
+}
+
+function modeLine(u) {
+  const mode = modeLabel(u.mode);
+  if (!mode) return "";
+  const roles = u.by_role || [];
+  const analysts = roles.find(r => r.role === "analyst");
+  let extra = "";
+  if (mode === "simplu") extra = " — 1× Sonnet pe runde de tool-uri, nu 15 analiști";
+  else if (mode === "avansat") {
+    const n = analysts ? analysts.calls : 0;
+    extra = n
+      ? ` — ${n} analiști Haiku + coordinator Sonnet`
+      : " — coordinator Sonnet + analiști Haiku";
+  }
+  return `<span class="mode">mod: <b>${mode}</b>${extra}</span>`;
+}
+
+function callsLines(u) {
+  const calls = u.calls_detail || [];
+  if (!calls.length) return "";
+  const rows = calls.map(c => {
+    const bits = [`${fmtTokens(c.input_tokens || 0)} in`, `${fmtTokens(c.output_tokens || 0)} out`];
+    if (c.cache_read_tokens) bits.push(`${fmtTokens(c.cache_read_tokens)} cache citit`);
+    if (c.cache_write_tokens) bits.push(`${fmtTokens(c.cache_write_tokens)} cache scris`);
+    const who = c.label || roleLabel(c.role);
+    return `<span class="call">#${c.seq} ${who} · ${shortModel(c.model)} · ` +
+           `<b>$${(c.cost_usd || 0).toFixed(4)}</b> · ${bits.join(" / ")}</span>`;
+  }).join("");
+  return `<span class="calls">${rows}</span>`;
+}
+
+function whyLine(u) {
+  if (modeLabel(u.mode) !== "simplu") return "";
+  const coord = (u.by_role || []).find(r => r.role === "coordinator");
+  const write = u.cache_write_tokens || 0;
+  if (!coord || coord.calls < 2) return "";
+  return `<span class="why">Nu e memory: Sonnet retrimite promptul sistem+tools de ${coord.calls} ori. ` +
+         `Scrierea în cache (${fmtTokens(write)} tokeni × $3.75/1M) e cea mai scumpă linie — de-asta modul simplu costă aproape ca avansatul.</span>`;
+}
+
 function showCost(u, bubble) {
   const anchor = bubble || bubbleOfTurn(u.turn_id);
   if (!anchor) return;
@@ -856,9 +918,12 @@ function showCost(u, bubble) {
       `${u.calls || 0} apeluri${u.prices_exact === false ? " (preț aproximativ)" : ""}`
     : "";
   const timeBit = time ? `<b>răspuns ${time}</b>` : "";
-  box.innerHTML = [timeBit, costBit].filter(Boolean).join(" · ") + apiLine(u.api);
-  box.title = (u.models || [])
-    .map(m => `${m.model}: ${m.calls} apeluri, $${m.cost_usd.toFixed(4)}`).join("\n");
+  box.innerHTML = [timeBit, costBit].filter(Boolean).join(" · ") +
+    modeLine(u) + callsLines(u) + whyLine(u) + apiLine(u.api);
+  const tip = [];
+  (u.by_role || []).forEach(r => tip.push(`${roleLabel(r.role)}: ${r.calls} apeluri, $${r.cost_usd.toFixed(4)}`));
+  (u.models || []).forEach(m => tip.push(`${m.model}: ${m.calls} apeluri, $${m.cost_usd.toFixed(4)}`));
+  box.title = tip.join("\n");
 }
 
 /* Diagnostic API-Football pentru tura curentă: câte apeluri, câte au eșuat și

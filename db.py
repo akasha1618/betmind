@@ -93,6 +93,7 @@ CREATE INDEX IF NOT EXISTS idx_analyses_fixture ON analyses(fixture_id, id);
 
 -- V1-B: jurnal de cost LLM (coordinator + analisti).
 -- V1-C: coloane de prompt caching (cache_read/cache_write).
+-- Rol/mod/eticheta: ce apel a platit tokenii (coordinator vs analist vs titlu).
 CREATE TABLE IF NOT EXISTS usage_log(
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     turn_id            TEXT,
@@ -101,7 +102,10 @@ CREATE TABLE IF NOT EXISTS usage_log(
     output_tokens      INTEGER,
     cache_read_tokens  INTEGER,
     cache_write_tokens INTEGER,
-    created_at         TEXT
+    created_at         TEXT,
+    role               TEXT,
+    mode               TEXT,
+    label              TEXT
 );
 
 -- V1-C: biletele prezentate utilizatorului (alimenteaza track record-ul V2).
@@ -157,7 +161,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, id);
 CREATE TABLE IF NOT EXISTS turn_stats(
     turn_id    TEXT PRIMARY KEY,
     latency_s  REAL,
-    created_at TEXT
+    created_at TEXT,
+    mode       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS oddspapi_cache(
@@ -202,6 +207,12 @@ _MIGRATIONS: dict[str, list[str]] = {
     "usage_log": [
         "ALTER TABLE usage_log ADD COLUMN cache_read_tokens INTEGER",
         "ALTER TABLE usage_log ADD COLUMN cache_write_tokens INTEGER",
+        "ALTER TABLE usage_log ADD COLUMN role TEXT",
+        "ALTER TABLE usage_log ADD COLUMN mode TEXT",
+        "ALTER TABLE usage_log ADD COLUMN label TEXT",
+    ],
+    "turn_stats": [
+        "ALTER TABLE turn_stats ADD COLUMN mode TEXT",
     ],
     "conversations": [
         "ALTER TABLE conversations ADD COLUMN title_auto INTEGER NOT NULL DEFAULT 0",
@@ -774,15 +785,26 @@ async def count_analyses(fixture_id: Optional[int] = None) -> int:
 async def add_usage(turn_id: str, model: str, input_tokens: Optional[int],
                     output_tokens: Optional[int], created_at: str,
                     cache_read_tokens: Optional[int] = None,
-                    cache_write_tokens: Optional[int] = None) -> None:
+                    cache_write_tokens: Optional[int] = None,
+                    role: Optional[str] = None,
+                    mode: Optional[str] = None,
+                    label: Optional[str] = None) -> None:
+    log.info(
+        "LLM usage turn=%s role=%s mode=%s label=%s model=%s "
+        "in=%s out=%s cache_read=%s cache_write=%s",
+        turn_id, role or "-", mode or "-", label or "-", model,
+        input_tokens or 0, output_tokens or 0,
+        cache_read_tokens or 0, cache_write_tokens or 0,
+    )
     conn = await _connect()
     try:
         await conn.execute(
             "INSERT INTO usage_log(turn_id, model, input_tokens, output_tokens, "
-            "cache_read_tokens, cache_write_tokens, created_at) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?)",
+            "cache_read_tokens, cache_write_tokens, created_at, role, mode, label) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (turn_id, model, input_tokens, output_tokens,
-             cache_read_tokens, cache_write_tokens, created_at),
+             cache_read_tokens, cache_write_tokens, created_at,
+             role, mode, label),
         )
         await conn.commit()
     finally:
@@ -1032,7 +1054,8 @@ async def usage_for_turn(turn_id: str) -> list[dict]:
     try:
         cur = await conn.execute(
             "SELECT model, input_tokens, output_tokens, cache_read_tokens, "
-            "cache_write_tokens, created_at FROM usage_log WHERE turn_id = ? ORDER BY id",
+            "cache_write_tokens, created_at, role, mode, label "
+            "FROM usage_log WHERE turn_id = ? ORDER BY id",
             (turn_id,),
         )
         return [dict(r) for r in await cur.fetchall()]
@@ -1040,13 +1063,16 @@ async def usage_for_turn(turn_id: str) -> list[dict]:
         await conn.close()
 
 
-async def save_turn_latency(turn_id: str, latency_s: float, now: str) -> None:
+async def save_turn_latency(turn_id: str, latency_s: float, now: str,
+                            mode: Optional[str] = None) -> None:
     conn = await _connect()
     try:
         await conn.execute(
-            "INSERT INTO turn_stats(turn_id, latency_s, created_at) VALUES(?, ?, ?) "
-            "ON CONFLICT(turn_id) DO UPDATE SET latency_s = excluded.latency_s",
-            (turn_id, float(latency_s), now),
+            "INSERT INTO turn_stats(turn_id, latency_s, created_at, mode) "
+            "VALUES(?, ?, ?, ?) "
+            "ON CONFLICT(turn_id) DO UPDATE SET latency_s = excluded.latency_s, "
+            "mode = COALESCE(excluded.mode, turn_stats.mode)",
+            (turn_id, float(latency_s), now, mode),
         )
         await conn.commit()
     finally:
@@ -1062,6 +1088,19 @@ async def turn_latency(turn_id: str) -> Optional[float]:
         if row is None or row["latency_s"] is None:
             return None
         return float(row["latency_s"])
+    finally:
+        await conn.close()
+
+
+async def turn_mode(turn_id: str) -> Optional[str]:
+    conn = await _connect()
+    try:
+        cur = await conn.execute(
+            "SELECT mode FROM turn_stats WHERE turn_id = ?", (turn_id,))
+        row = await cur.fetchone()
+        if row is None or not row["mode"]:
+            return None
+        return str(row["mode"])
     finally:
         await conn.close()
 

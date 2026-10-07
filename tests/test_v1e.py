@@ -61,6 +61,11 @@ async def test_advanced_mode_is_chosen_per_request(no_http, monkeypatch, env_mod
     assert "analyze_matches" not in _tool_names(captured[1])
     assert adv[0]["mode"] == "analysts" and std[0]["mode"] == "classic"
     assert adv[0]["premium_required"] is False
+    adv_usage = next(e for e in adv if e["type"] == "usage")
+    std_usage = next(e for e in std if e["type"] == "usage")
+    assert adv_usage["mode"] == "analysts" and std_usage["mode"] == "classic"
+    assert std_usage["calls_detail"][0]["role"] == "coordinator"
+    assert std_usage["calls_detail"][0]["mode"] == "classic"
 
     # Promptul urmeaza acelasi mod ca tool-urile.
     assert "analyze_matches" in captured[0]["system"][0]["text"]
@@ -266,6 +271,31 @@ def test_cost_math_and_unknown_model_is_flagged():
     assert unknown["cost_usd"] > 0
 
 
+def test_summarize_breaks_down_role_mode_and_each_call():
+    rows = [
+        {"model": "claude-sonnet-4-6", "role": "coordinator", "mode": "classic",
+         "label": "runda 1 · tool_use", "input_tokens": 6, "output_tokens": 200,
+         "cache_read_tokens": 0, "cache_write_tokens": 85_700},
+        {"model": "claude-sonnet-4-6", "role": "coordinator", "mode": "classic",
+         "label": "runda 2 · end_turn", "input_tokens": 0, "output_tokens": 3600,
+         "cache_read_tokens": 121_300, "cache_write_tokens": 0},
+        {"model": "claude-haiku-4-5", "role": "title", "mode": None,
+         "label": "titlu conversație", "input_tokens": 400, "output_tokens": 20,
+         "cache_read_tokens": 0, "cache_write_tokens": 0},
+    ]
+    s = pricing.summarize(rows)
+    assert s["mode"] == "classic"
+    assert s["calls"] == 3
+    assert len(s["calls_detail"]) == 3
+    assert s["calls_detail"][0]["label"] == "runda 1 · tool_use"
+    assert s["calls_detail"][0]["cost_usd"] == pytest.approx(
+        pricing.cost_of("claude-sonnet-4-6", 6, 200, 0, 85_700))
+    roles = {r["role"]: r for r in s["by_role"]}
+    assert roles["coordinator"]["calls"] == 2
+    assert roles["title"]["calls"] == 1
+    assert roles["coordinator"]["cost_usd"] > roles["title"]["cost_usd"]
+
+
 async def test_turn_cost_includes_history_and_is_exposed_to_dev_mode(no_http, monkeypatch):
     """Costul intrebarii = toate apelurile turei; tokenii de intrare includ
     deja istoricul retrimis modelului."""
@@ -300,6 +330,12 @@ async def test_turn_cost_includes_history_and_is_exposed_to_dev_mode(no_http, mo
     assert api["calls"] == 2
     assert usage[0]["latency_s"] >= 0
     assert api["latency_s"] == pytest.approx(usage[0]["latency_s"])
+    assert usage[0]["mode"] in ("classic", "analysts")
+    assert api["mode"] == usage[0]["mode"]
+    assert len(usage[0]["calls_detail"]) == 2
+    assert all(c["role"] == "coordinator" for c in usage[0]["calls_detail"])
+    assert usage[0]["calls_detail"][0]["label"]
+    assert {r["role"] for r in usage[0]["by_role"]} == {"coordinator"}
 
 
 async def test_dev_mode_latency_tracks_wall_clock(no_http, monkeypatch):

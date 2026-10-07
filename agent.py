@@ -957,14 +957,16 @@ async def run_turn(messages: list[dict],
 
     base_url = os.environ.get("ANTHROPIC_BASE_URL", "").strip() or "https://api.anthropic.com"
     token_cap = max_tokens()
-    log.info(
-        "Anthropic call start model=%s max_tokens=%s messages=%d base_url=%s key_prefix=%s…",
-        MODEL, token_cap, len(messages), base_url, api_key[:12],
-    )
-
+    effective_mode = mode or analysts.orchestration_mode()
     client = AsyncAnthropic(api_key=api_key, timeout=anthropic_timeout_s())
     system_prompt = build_system_prompt(mode)
     tools = build_tools(mode)
+    log.info(
+        "Anthropic call start model=%s mode=%s tools=%d max_tokens=%s messages=%d "
+        "base_url=%s key_prefix=%s…",
+        MODEL, effective_mode, len(tools), token_cap, len(messages),
+        base_url, api_key[:12],
+    )
     turn_id = turn_id or uuid.uuid4().hex
     continues = 0
     last_ticket_selections: list = []
@@ -1024,6 +1026,9 @@ async def run_turn(messages: list[dict],
                         fd.now_local().isoformat(timespec="seconds"),
                         cache_read_tokens=getattr(final.usage, "cache_read_input_tokens", None),
                         cache_write_tokens=getattr(final.usage, "cache_creation_input_tokens", None),
+                        role="coordinator",
+                        mode=effective_mode,
+                        label=f"runda {iteration + 1} · {final.stop_reason or '?'}",
                     )
                 except Exception:
                     log.exception("Nu am putut scrie usage_log (coordinator)")

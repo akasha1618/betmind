@@ -1052,8 +1052,10 @@ def _try_repair_truncated_json(blob: str) -> Optional[dict]:
     return obj if isinstance(obj, dict) else None
 
 
-async def _log_usage(turn_id: Optional[str], usage: Any) -> None:
+async def _log_usage(turn_id: Optional[str], usage: Any,
+                     fixture_id: Optional[int] = None) -> None:
     try:
+        fid = int(fixture_id) if fixture_id is not None else None
         await db.add_usage(
             turn_id or "analyst",
             analyst_model(),
@@ -1062,6 +1064,9 @@ async def _log_usage(turn_id: Optional[str], usage: Any) -> None:
             fd.now_local().isoformat(timespec="seconds"),
             cache_read_tokens=getattr(usage, "cache_read_input_tokens", None),
             cache_write_tokens=getattr(usage, "cache_creation_input_tokens", None),
+            role="analyst",
+            mode="analysts",
+            label=f"meci {fid}" if fid is not None else None,
         )
     except Exception:
         log.exception("Nu am putut scrie usage_log (analist)")
@@ -1122,7 +1127,7 @@ async def analyze_match(fixture_id: int, turn_id: Optional[str] = None,
             result = await _call_analyst_llm(system, user_content)
             text, usage, stop_reason = _unpack_llm_result(result)
             prev_text, prev_stop = text, stop_reason
-            await _log_usage(turn_id, usage)
+            await _log_usage(turn_id, usage, fixture_id)
             raw = _extract_json(text)
             probs = dict(raw.get("market_probs") or {})
             for k in _DC_KEYS:

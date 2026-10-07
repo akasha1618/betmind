@@ -100,7 +100,11 @@ async def generate_title(user_message: str, assistant_text: str = "",
         await db.add_usage(turn_id or "title", title_model(),
                            getattr(usage, "input_tokens", None),
                            getattr(usage, "output_tokens", None),
-                           fd.now_local().isoformat(timespec="seconds"))
+                           fd.now_local().isoformat(timespec="seconds"),
+                           cache_read_tokens=getattr(usage, "cache_read_input_tokens", None),
+                           cache_write_tokens=getattr(usage, "cache_creation_input_tokens", None),
+                           role="title",
+                           label="titlu conversație")
     except Exception:
         pass
     return clean_title(text)

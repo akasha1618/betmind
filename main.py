@@ -436,12 +436,16 @@ async def _produce_turn(turn: turns.Turn, history: list[dict], start_len: int,
                 log.error("Chat error event: %s", event.get("message"))
             await turn.publish(event)
         latency_s = round(max(0.0, time.monotonic() - t0), 3)
+        turn_mode = active_mode or analysts.orchestration_mode()
         with contextlib.suppress(Exception):
             await db.save_turn_latency(
-                turn_id, latency_s, fd.now_local().isoformat(timespec="seconds"))
+                turn_id, latency_s, fd.now_local().isoformat(timespec="seconds"),
+                mode=turn_mode)
+            summary = pricing.summarize(await db.usage_for_turn(turn_id))
             await turn.publish({
                 "type": "usage", "turn_id": turn_id,
-                **pricing.summarize(await db.usage_for_turn(turn_id)),
+                **summary,
+                "mode": turn_mode or summary.get("mode"),
                 "api": fd.turn_api_stats(turn_id),
                 "latency_s": latency_s,
             })
@@ -460,7 +464,8 @@ async def _produce_turn(turn: turns.Turn, history: list[dict], start_len: int,
             latency_s = round(max(0.0, time.monotonic() - t0), 3)
             with contextlib.suppress(Exception):
                 await db.save_turn_latency(
-                    turn_id, latency_s, fd.now_local().isoformat(timespec="seconds"))
+                    turn_id, latency_s, fd.now_local().isoformat(timespec="seconds"),
+                    mode=active_mode or analysts.orchestration_mode())
         try:
             await _persist_turn(conv_id, history, start_len, "".join(partial),
                                 first_turn, user_text, turn_id)
@@ -616,7 +621,9 @@ async def usage(turn_id: str):
     """Costul unei ture (toate apelurile Claude cu acelasi turn_id) plus ce s-a
     intamplat cu API-Football in tura respectiva (diagnostic pentru modul dev)."""
     rows = await db.usage_for_turn(turn_id)
-    return {"turn_id": turn_id, **pricing.summarize(rows),
+    summary = pricing.summarize(rows)
+    return {"turn_id": turn_id, **summary,
+            "mode": await db.turn_mode(turn_id) or summary.get("mode"),
             "api": fd.turn_api_stats(turn_id),
             "latency_s": await db.turn_latency(turn_id)}
 
